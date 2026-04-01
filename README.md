@@ -1,6 +1,6 @@
 # fbd
 
-A [Fistbump](https://fbd.dev) full node written in Swift.
+A [Fistbump](https://fistbump.org) full node written in Swift.
 
 Full documentation at [fbd.dev](https://fbd.dev)
 
