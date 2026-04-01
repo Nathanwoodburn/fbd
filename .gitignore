@@ -1,0 +1,15 @@
+.DS_Store
+._*
+/.build
+/.build_x64
+/.build_aarch64
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+Package.resolved
+Sources/Base/BuildInfo.swift
+
+dist/

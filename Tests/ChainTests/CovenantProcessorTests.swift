@@ -1,0 +1,1490 @@
+import XCTest
+@testable import Chain
+import Base
+import Protocol
+import Covenants
+@testable import Consensus
+import ExtCrypto
+
+final class CovenantProcessorTests: XCTestCase {
+
+    // MARK: - Helpers
+
+    private let nameParams = NameParams.regtest
+    private let network = NetworkType.regtest
+
+    /// Create a simple NameDB for testing.
+    private func makeNameDB() -> NameDB { NameDB() }
+
+    /// Create a mock chain (header-only, no coinDB).
+    private func makeChain() throws -> Chain {
+        try Chain(network: .regtest)
+    }
+
+    /// Make a dummy txHash from an integer seed.
+    private func txHash(_ seed: UInt8) -> Hash256 {
+        Hash256(unchecked: [UInt8](repeating: seed, count: 32))
+    }
+
+    /// Make a simple outpoint.
+    private func outpoint(_ seed: UInt8, _ index: UInt32) -> Outpoint {
+        Outpoint(hash: txHash(seed), index: index)
+    }
+
+    /// Create a CoinView with a single coin pre-loaded.
+    private func viewWithCoin(
+        at op: Outpoint, value: UInt64, covenant: Covenant, height: Int = 100
+    ) -> CoinView {
+        var view = CoinView()
+        let output = Output(value: value, address: .null, covenant: covenant)
+        let entry = CoinEntry.fromOutput(output, height: height, coinbase: false)
+        view.addEntry(op, entry)
+        return view
+    }
+
+    /// Compute the SHA3-256 name hash for a test name.
+    private func nameHash(for name: String) -> NameHash {
+        NameRules.hashName(name)
+    }
+
+    /// Build a simple transaction with one input and one output.
+    private func simpleTx(
+        input: Outpoint,
+        outputValue: UInt64,
+        covenant: Covenant
+    ) -> Transaction {
+        Transaction(
+            inputs: [Input(prevout: input)],
+            outputs: [Output(value: outputValue, address: .null, covenant: covenant)]
+        )
+    }
+
+    // MARK: - NameDB Tests
+
+    func testNameDBGetPutRoundtrip() throws {
+        let db = makeNameDB()
+        let nh = nameHash(for: "testname")
+
+        // Initially nil
+        XCTAssertNil(try db.getNameState(nh))
+
+        // Put and retrieve
+        var ns = NameState(nameHash: nh, name: Array("testname".utf8))
+        ns.height = 42
+        ns.renewal = 42
+        db.putNameState(nh, ns)
+
+        let retrieved = try db.getNameState(nh)
+        XCTAssertNotNil(retrieved)
+        XCTAssertEqual(retrieved?.height, 42)
+    }
+
+    func testNameDBCommit() throws {
+        let db = makeNameDB()
+        let nh = nameHash(for: "committest")
+
+        var ns = NameState(nameHash: nh, name: Array("committest".utf8))
+        ns.height = 10
+        ns.renewal = 10
+        db.putNameState(nh, ns)
+
+        // Before commit, tree root should be zero (pending not yet flushed)
+        let rootBefore = try db.treeRoot()
+        XCTAssertEqual(rootBefore, [UInt8](repeating: 0, count: 32))
+
+        // After commit, tree root should change
+        try db.commit()
+        let rootAfter = try db.treeRoot()
+        XCTAssertNotEqual(rootAfter, [UInt8](repeating: 0, count: 32))
+
+        // Should still be retrievable from tree after commit
+        let retrieved = try db.getNameState(nh)
+        XCTAssertNotNil(retrieved)
+        XCTAssertEqual(retrieved?.height, 10)
+    }
+
+    // MARK: - OPEN Tests
+
+    func testOpenValid() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "testopen"
+        let nh = nameHash(for: name)
+        let height = 10 // regtest: noRollout, auctionStart = 0
+
+        let covenant = CovenantData.makeOpen(nameHash: nh, name: Array(name.utf8))
+        let tx = simpleTx(input: .null, outputValue: 0, covenant: covenant)
+        var view = CoinView()
+        view.addTX(tx, height: height)
+
+        try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )
+
+        let ns = try db.getNameState(nh)
+        XCTAssertNotNil(ns)
+        XCTAssertEqual(ns?.height, height)
+        XCTAssertEqual(ns?.renewal, height)
+    }
+
+    func testOpenDuplicateInBlock() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "dupopen"
+        let nh = nameHash(for: name)
+        let height = 10
+
+        let covenant = CovenantData.makeOpen(nameHash: nh, name: Array(name.utf8))
+        // Two outputs with the same name OPEN in one tx — hsd allows this
+        let tx = Transaction(
+            inputs: [Input(prevout: .null), Input(prevout: .null)],
+            outputs: [
+                Output(value: 0, address: .null, covenant: covenant),
+                Output(value: 0, address: .null, covenant: covenant),
+            ]
+        )
+        var view = CoinView()
+        view.addTX(tx, height: height)
+
+        // hsd does NOT reject duplicate name outputs per tx
+        XCTAssertNoThrow(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        ))
+    }
+
+    func testOpenNameAlreadyActive() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "active"
+        let nh = nameHash(for: name)
+        let height = 10
+
+        // Pre-populate an active name state
+        var existing = NameState(nameHash: nh, name: Array(name.utf8))
+        existing.height = 5
+        existing.renewal = 5
+        db.putNameState(nh, existing)
+
+        let covenant = CovenantData.makeOpen(nameHash: nh, name: Array(name.utf8))
+        let tx = simpleTx(input: .null, outputValue: 0, covenant: covenant)
+        var view = CoinView()
+        view.addTX(tx, height: height)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        ))
+    }
+
+    // MARK: - BID Tests
+
+    func testBidInBiddingPhase() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "bidtest"
+        let nh = nameHash(for: name)
+        // regtest: openPeriod = 6
+        let openHeight = 10
+        let bidHeight = openHeight + nameParams.openPeriod // Should be in bidding
+
+        // Create name state at openHeight
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        db.putNameState(nh, ns)
+
+        // Verify we're in bidding state
+        XCTAssertEqual(ns.state(at: bidHeight, params: nameParams), .bidding)
+
+        let bidValue: UInt64 = 200_000_000 // 200 FBC (above minimum bid)
+        let blind = try BlindBid.blind(value: bidValue, nonce: BidNonce(unchecked: [UInt8](repeating: 0xAA, count: 32)))
+        let covenant = CovenantData.makeBid(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8), blind: blind
+        )
+        let tx = simpleTx(input: outpoint(0x01, 0), outputValue: bidValue, covenant: covenant)
+        let view = viewWithCoin(at: outpoint(0x01, 0), value: bidValue, covenant: .none)
+
+        try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: bidHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )
+        // BID doesn't modify state, just validates
+    }
+
+    func testBidOutsideBiddingFails() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "bidfail"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        // During reveal period (after bidding ends)
+        let revealHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        db.putNameState(nh, ns)
+
+        XCTAssertEqual(ns.state(at: revealHeight, params: nameParams), .reveal)
+
+        let blind = try BlindBid.blind(value: 1000, nonce: BidNonce(unchecked: [UInt8](repeating: 0xBB, count: 32)))
+        let covenant = CovenantData.makeBid(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8), blind: blind
+        )
+        let tx = simpleTx(input: outpoint(0x02, 0), outputValue: 1000, covenant: covenant)
+        let view = viewWithCoin(at: outpoint(0x02, 0), value: 1000, covenant: .none)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: revealHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        ))
+    }
+
+    // MARK: - REVEAL Tests
+
+    func testRevealVerifiesBlind() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "revealtest"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let revealHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        db.putNameState(nh, ns)
+
+        XCTAssertEqual(ns.state(at: revealHeight, params: nameParams), .reveal)
+
+        let nonce = BidNonce(unchecked: [UInt8](repeating: 0xCC, count: 32))
+        let bidValue: UInt64 = 5000
+        let blind = try BlindBid.blind(value: bidValue, nonce: nonce)
+
+        // BID covenant for the input coin
+        let bidCovenant = CovenantData.makeBid(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8), blind: blind
+        )
+        let bidOutpoint = outpoint(0x03, 0)
+
+        // REVEAL covenant for the output
+        let revealCovenant = CovenantData.makeReveal(
+            nameHash: nh, startHeight: openHeight, nonce: nonce
+        )
+        let tx = simpleTx(input: bidOutpoint, outputValue: bidValue, covenant: revealCovenant)
+        let view = viewWithCoin(at: bidOutpoint, value: bidValue, covenant: bidCovenant)
+
+        try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: revealHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )
+
+        let updated = try db.getNameState(nh)
+        XCTAssertEqual(updated?.highest, Int64(bidValue))
+    }
+
+    func testRevealWrongBlindFails() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "badreveal"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let revealHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        db.putNameState(nh, ns)
+
+        let nonce = BidNonce(unchecked: [UInt8](repeating: 0xDD, count: 32))
+        let blind = try BlindBid.blind(value: 1000, nonce: nonce)
+        let bidCovenant = CovenantData.makeBid(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8), blind: blind
+        )
+        let bidOutpoint = outpoint(0x04, 0)
+
+        // REVEAL with wrong value (2000 instead of 1000)
+        let revealCovenant = CovenantData.makeReveal(
+            nameHash: nh, startHeight: openHeight, nonce: nonce
+        )
+        let tx = simpleTx(input: bidOutpoint, outputValue: 2000, covenant: revealCovenant)
+        let view = viewWithCoin(at: bidOutpoint, value: 1000, covenant: bidCovenant)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: revealHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        ))
+    }
+
+    // MARK: - Vickrey Auction Tests
+
+    func testRevealVickreyAuction() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "vickrey"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let revealHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        db.putNameState(nh, ns)
+
+        // First reveal: 3000
+        let nonce1 = BidNonce(unchecked: [UInt8](repeating: 0x01, count: 32))
+        let blind1 = try BlindBid.blind(value: 3000, nonce: nonce1)
+        let bidCov1 = CovenantData.makeBid(nameHash: nh, startHeight: openHeight, name: Array(name.utf8), blind: blind1)
+        let bidOp1 = outpoint(0x10, 0)
+        let revealCov1 = CovenantData.makeReveal(nameHash: nh, startHeight: openHeight, nonce: nonce1)
+        let tx1 = simpleTx(input: bidOp1, outputValue: 3000, covenant: revealCov1)
+        let view1 = viewWithCoin(at: bidOp1, value: 3000, covenant: bidCov1)
+
+        try CovenantProcessor.processCovenants(
+            tx: tx1, txIndex: 0, coinView: view1, nameDB: db,
+            height: revealHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )
+
+        // Second reveal: 5000 (higher)
+        let nonce2 = BidNonce(unchecked: [UInt8](repeating: 0x02, count: 32))
+        let blind2 = try BlindBid.blind(value: 5000, nonce: nonce2)
+        let bidCov2 = CovenantData.makeBid(nameHash: nh, startHeight: openHeight, name: Array(name.utf8), blind: blind2)
+        let bidOp2 = outpoint(0x11, 0)
+        let revealCov2 = CovenantData.makeReveal(nameHash: nh, startHeight: openHeight, nonce: nonce2)
+        let tx2 = simpleTx(input: bidOp2, outputValue: 5000, covenant: revealCov2)
+        let view2 = viewWithCoin(at: bidOp2, value: 5000, covenant: bidCov2)
+
+        try CovenantProcessor.processCovenants(
+            tx: tx2, txIndex: 1, coinView: view2, nameDB: db,
+            height: revealHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )
+
+        let updated = try db.getNameState(nh)
+        // Highest bid is 5000, second-highest (Vickrey price) is 3000
+        XCTAssertEqual(updated?.highest, 5000)
+        XCTAssertEqual(updated?.value, 3000)
+    }
+
+    // MARK: - REGISTER Tests
+
+    func testRegisterOnlyWinner() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "regwinner"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        // Set up a closed name with owner at (0x20, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.owner = NameState.Outpoint(hash: txHash(0x20).bytes, index: 0)
+        ns.value = 3000
+        ns.highest = 5000
+        db.putNameState(nh, ns)
+
+        XCTAssertEqual(ns.state(at: closedHeight, params: nameParams), .closed)
+
+        // Non-owner tries to register
+        let loserOutpoint = outpoint(0x21, 0)
+        let revealCov = CovenantData.makeReveal(
+            nameHash: nh, startHeight: openHeight,
+            nonce: .zero
+        )
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let tx = simpleTx(input: loserOutpoint, outputValue: 3000, covenant: registerCov)
+        let view = viewWithCoin(at: loserOutpoint, value: 3000, covenant: revealCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        ))
+    }
+
+    // MARK: - TRANSFER / FINALIZE Tests
+
+    func testTransferFinalizeLockup() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "xfertest"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        let ownerOp = outpoint(0x30, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(0x30).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        ns.transfer = closedHeight // Transfer initiated at closedHeight
+        db.putNameState(nh, ns)
+
+        // FINALIZE too early (before transferLockup elapses)
+        let tooEarlyHeight = closedHeight + nameParams.transferLockup - 1
+
+        let transferCov = CovenantData.makeTransfer(
+            nameHash: nh, startHeight: openHeight,
+            version: 0, addressHash: [UInt8](repeating: 0, count: 20)
+        )
+        let finalizeCov = CovenantData.makeFinalize(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8), flags: 0,
+            claimed: 0, renewals: 0,
+            blockHash: [UInt8](repeating: 0, count: 32)
+        )
+
+        let transferOutpoint = outpoint(0x31, 0)
+        let tx = simpleTx(input: transferOutpoint, outputValue: 1000, covenant: finalizeCov)
+        let view = viewWithCoin(at: transferOutpoint, value: 1000, covenant: transferCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: tooEarlyHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        ))
+    }
+
+    // MARK: - REVOKE Tests
+
+    func testRevokeTerminal() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "revoketest"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        let ownerOp = outpoint(0x40, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(0x40).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        ns.data = [1, 2, 3]
+        db.putNameState(nh, ns)
+
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [1, 2, 3], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let revokeCov = CovenantData.makeRevoke(nameHash: nh, startHeight: openHeight)
+
+        let tx = simpleTx(input: ownerOp, outputValue: 0, covenant: revokeCov)
+        let view = viewWithCoin(at: ownerOp, value: 1000, covenant: registerCov)
+
+        try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )
+
+        let updated = try db.getNameState(nh)
+        XCTAssertEqual(updated?.revoked, closedHeight)
+        XCTAssertEqual(updated?.data, [])
+        XCTAssertEqual(updated?.transfer, 0)
+    }
+
+    // MARK: - Tree Root Tests
+
+    func testTreeRootStableAfterCommit() throws {
+        let db = makeNameDB()
+        let nh = nameHash(for: "treetest")
+
+        var ns = NameState(nameHash: nh, name: Array("treetest".utf8))
+        ns.height = 5
+        ns.renewal = 5
+        db.putNameState(nh, ns)
+        try db.commit()
+
+        let root1 = try db.treeRoot()
+
+        // Same state committed again should produce same root
+        db.putNameState(nh, ns)
+        try db.commit()
+
+        let root2 = try db.treeRoot()
+        XCTAssertEqual(root1, root2)
+    }
+
+    func testTreeRootChangesWithDifferentState() throws {
+        let db = makeNameDB()
+        let nh = nameHash(for: "changetree")
+
+        var ns = NameState(nameHash: nh, name: Array("changetree".utf8))
+        ns.height = 5
+        ns.renewal = 5
+        db.putNameState(nh, ns)
+        try db.commit()
+        let root1 = try db.treeRoot()
+
+        // Modify the state
+        ns.height = 10
+        ns.renewal = 10
+        db.putNameState(nh, ns)
+        try db.commit()
+        let root2 = try db.treeRoot()
+
+        XCTAssertNotEqual(root1, root2)
+    }
+
+    // MARK: - NameParams Factory Tests
+
+    func testNameParamsFactory() {
+        let main = NameParams.params(for: .main)
+        XCTAssertEqual(main.treeInterval, 30)
+        XCTAssertFalse(main.noRollout)
+
+        let regtest = NameParams.params(for: .regtest)
+        XCTAssertEqual(regtest.treeInterval, 5)
+        XCTAssertTrue(regtest.noRollout)
+
+        let simnet = NameParams.params(for: .simnet)
+        XCTAssertEqual(simnet.treeInterval, 5)
+    }
+
+    // MARK: - Edge Case: OPEN nameHash mismatch
+
+    func testOpenRejectsNameHashMismatch() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "mismatch"
+        let height = 10
+
+        // Use a bogus nameHash that does NOT equal SHA3(rawName)
+        let bogusHash = NameHash(unchecked: [UInt8](repeating: 0xDE, count: 32))
+        let covenant = CovenantData.makeOpen(nameHash: bogusHash, name: Array(name.utf8))
+        let tx = simpleTx(input: .null, outputValue: 0, covenant: covenant)
+        var view = CoinView()
+        view.addTX(tx, height: height)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .malformedCovenant(let msg) = covErr {
+                XCTAssertTrue(msg.contains("nameHash"), "Expected nameHash mismatch message, got: \(msg)")
+            } else {
+                XCTFail("Expected malformedCovenant, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: OPEN invalid name
+
+    func testOpenRejectsInvalidName() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let height = 10
+
+        // Uppercase letters in the name should be rejected
+        let invalidName = "BadName"
+        let nh = nameHash(for: invalidName)
+        let covenant = CovenantData.makeOpen(nameHash: nh, name: Array(invalidName.utf8))
+        let tx = simpleTx(input: .null, outputValue: 0, covenant: covenant)
+        var view = CoinView()
+        view.addTX(tx, height: height)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .malformedCovenant(let msg) = covErr {
+                XCTAssertTrue(msg.contains("invalid name"), "Expected invalid name message, got: \(msg)")
+            } else {
+                XCTFail("Expected malformedCovenant, got \(covErr)")
+            }
+        }
+
+        // Also test special characters
+        let specialName = "bad!name"
+        let nh2 = nameHash(for: specialName)
+        let covenant2 = CovenantData.makeOpen(nameHash: nh2, name: Array(specialName.utf8))
+        let tx2 = simpleTx(input: .null, outputValue: 0, covenant: covenant2)
+        var view2 = CoinView()
+        view2.addTX(tx2, height: height)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx2, txIndex: 0, coinView: view2, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        ))
+    }
+
+    // MARK: - Edge Case: UPDATE requires owner outpoint
+
+    /// Helper: set up a registered name and return the name hash, open height, and closed height.
+    private func setupRegisteredName(
+        _ name: String,
+        db: NameDB,
+        ownerSeed: UInt8
+    ) -> (nh: NameHash, openHeight: Int, closedHeight: Int) {
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(ownerSeed).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        db.putNameState(nh, ns)
+
+        return (nh, openHeight, closedHeight)
+    }
+
+    func testUpdateRequiresOwnerOutpoint() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let (nh, openHeight, closedHeight) = setupRegisteredName("updown", db: db, ownerSeed: 0x50)
+
+        // Non-owner input tries to UPDATE
+        let nonOwnerOp = outpoint(0x99, 0)
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let updateCov = CovenantData.makeUpdate(nameHash: nh, startHeight: openHeight, resource: [])
+        let tx = simpleTx(input: nonOwnerOp, outputValue: 1000, covenant: updateCov)
+        let view = viewWithCoin(at: nonOwnerOp, value: 1000, covenant: registerCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("only owner can UPDATE"), "Got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: TRANSFER requires owner outpoint
+
+    func testTransferRequiresOwnerOutpoint() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let (nh, openHeight, closedHeight) = setupRegisteredName("xferbad", db: db, ownerSeed: 0x51)
+
+        let nonOwnerOp = outpoint(0x99, 0)
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let transferCov = CovenantData.makeTransfer(
+            nameHash: nh, startHeight: openHeight,
+            version: 0, addressHash: [UInt8](repeating: 0, count: 20)
+        )
+        let tx = simpleTx(input: nonOwnerOp, outputValue: 1000, covenant: transferCov)
+        let view = viewWithCoin(at: nonOwnerOp, value: 1000, covenant: registerCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("only owner can TRANSFER"), "Got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: RENEW requires owner outpoint
+
+    func testRenewRequiresOwnerOutpoint() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let (nh, openHeight, closedHeight) = setupRegisteredName("renewbad", db: db, ownerSeed: 0x52)
+
+        let nonOwnerOp = outpoint(0x99, 0)
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let renewCov = CovenantData.makeRenew(
+            nameHash: nh, startHeight: openHeight,
+            blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let tx = simpleTx(input: nonOwnerOp, outputValue: 1000, covenant: renewCov)
+        let view = viewWithCoin(at: nonOwnerOp, value: 1000, covenant: registerCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("only owner can RENEW"), "Got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: FINALIZE requires owner outpoint
+
+    func testFinalizeRequiresOwnerOutpoint() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let (nh, openHeight, closedHeight) = setupRegisteredName("finbad", db: db, ownerSeed: 0x53)
+
+        // Set up transfer so FINALIZE is otherwise valid
+        var ns = try db.getNameState(nh)!
+        ns.transfer = closedHeight
+        db.putNameState(nh, ns)
+
+        let finalizeHeight = closedHeight + nameParams.transferLockup
+
+        let nonOwnerOp = outpoint(0x99, 0)
+        let transferCov = CovenantData.makeTransfer(
+            nameHash: nh, startHeight: openHeight,
+            version: 0, addressHash: [UInt8](repeating: 0, count: 20)
+        )
+        let finalizeCov = CovenantData.makeFinalize(
+            nameHash: nh, startHeight: openHeight,
+            name: Array("finbad".utf8), flags: 0,
+            claimed: 0, renewals: 0,
+            blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let tx = simpleTx(input: nonOwnerOp, outputValue: 1000, covenant: finalizeCov)
+        let view = viewWithCoin(at: nonOwnerOp, value: 1000, covenant: transferCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: finalizeHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("only owner can FINALIZE"), "Got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: REVOKE requires owner outpoint
+
+    func testRevokeRequiresOwnerOutpoint() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let (nh, openHeight, closedHeight) = setupRegisteredName("revbad", db: db, ownerSeed: 0x54)
+
+        let nonOwnerOp = outpoint(0x99, 0)
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let revokeCov = CovenantData.makeRevoke(nameHash: nh, startHeight: openHeight)
+        let tx = simpleTx(input: nonOwnerOp, outputValue: 0, covenant: revokeCov)
+        let view = viewWithCoin(at: nonOwnerOp, value: 1000, covenant: registerCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("only owner can REVOKE"), "Got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: UPDATE rejects wrong input covenant type
+
+    func testUpdateRejectsWrongInputCovenantType() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "badtrans"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        // Set up a registered name where the owner outpoint matches what we will use
+        let ownerOp = outpoint(0x60, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(0x60).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        db.putNameState(nh, ns)
+
+        // Input coin has a .bid covenant (invalid for UPDATE transition)
+        let bidCov = CovenantData.makeBid(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8),
+            blind: [UInt8](repeating: 0, count: 32)
+        )
+        let updateCov = CovenantData.makeUpdate(nameHash: nh, startHeight: openHeight, resource: [])
+        let tx = simpleTx(input: ownerOp, outputValue: 1000, covenant: updateCov)
+        let view = viewWithCoin(at: ownerOp, value: 1000, covenant: bidCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .invalidStateTransition = covErr {
+                // Expected
+            } else {
+                XCTFail("Expected invalidStateTransition, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: REGISTER rejects nil owner
+
+    func testRegisterRejectsNilOwner() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "nilowner"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        // Set up a name in closed state but with owner = nil (no reveals happened)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        // owner is nil by default — nobody revealed
+        db.putNameState(nh, ns)
+
+        XCTAssertEqual(ns.state(at: closedHeight, params: nameParams), .closed)
+
+        let revealCov = CovenantData.makeReveal(
+            nameHash: nh, startHeight: openHeight,
+            nonce: .zero
+        )
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let inputOp = outpoint(0x70, 0)
+        let tx = simpleTx(input: inputOp, outputValue: 0, covenant: registerCov)
+        let view = viewWithCoin(at: inputOp, value: 1000, covenant: revealCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            // Owner is nil, so the owner check guard will fail
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("owner"), "Expected owner-related message, got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState for nil owner, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: REDEEM validates input type
+
+    func testRedeemValidatesInputType() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "redeemval"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        // Set up a closed name with an owner (so it is closed, not expired)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(0xAA).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        db.putNameState(nh, ns)
+
+        XCTAssertEqual(ns.state(at: closedHeight, params: nameParams), .closed)
+
+        // Input coin has a .bid covenant (invalid: REDEEM input must be REVEAL)
+        let bidCov = CovenantData.makeBid(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8),
+            blind: [UInt8](repeating: 0, count: 32)
+        )
+        let redeemCov = CovenantData.makeRedeem(nameHash: nh, startHeight: openHeight)
+        let inputOp = outpoint(0x71, 0)
+        let tx = simpleTx(input: inputOp, outputValue: 0, covenant: redeemCov)
+        let view = viewWithCoin(at: inputOp, value: 1000, covenant: bidCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .invalidStateTransition = covErr {
+                // Expected: REDEEM input must be REVEAL
+            } else {
+                XCTFail("Expected invalidStateTransition, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: REGISTER delegation check after flags
+
+    func testRegisterDelegationCheckAfterFlags() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "subdelflag"
+        let nh = nameHash(for: name)
+        let openHeight = 0
+        let height = 5 // below regtest renewalMaturity (10) so zeroed blockHash passes
+
+        let ownerOp = outpoint(0x80, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true // enables early .closed state at low heights
+        ns.owner = NameState.Outpoint(hash: txHash(0x80).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        // flags = 0 initially (auctionSubdomains not yet set)
+        db.putNameState(nh, ns)
+
+        XCTAssertEqual(ns.state(at: height, params: nameParams), .closed)
+
+        // Resource containing a delegation record (NS record, type=1)
+        // Resource format: [version=0] [type=1 (NS)] [DNS name "ns.example" encoded]
+        let delegationResource: [UInt8] = [
+            0x00,       // version
+            0x01,       // NS record type
+            0x02, 0x6E, 0x73, // "ns" label (len=2)
+            0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // "example" label (len=7)
+            0x00,       // end of name
+        ]
+
+        // REGISTER with flags=1 (enable auctionSubdomains) AND delegation resource
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: delegationResource,
+            blockHash: [UInt8](repeating: 0, count: 32),
+            flags: 1  // enable auctionSubdomains
+        )
+        let revealCov = CovenantData.makeReveal(
+            nameHash: nh, startHeight: openHeight,
+            nonce: .zero
+        )
+
+        let tx = simpleTx(input: ownerOp, outputValue: 0, covenant: registerCov)
+        let view = viewWithCoin(at: ownerOp, value: 1000, covenant: revealCov)
+
+        // Should throw delegationNotAllowedWithSubdomains because:
+        // 1. flags are applied first (enabling auctionSubdomains)
+        // 2. then delegation check sees auctionSubdomains=true + delegation records
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            XCTAssertEqual(covErr, CovenantsError.delegationNotAllowedWithSubdomains)
+        }
+    }
+
+    // MARK: - Edge Case: Claimed outputs prevents payment reuse
+
+    func testClaimedOutputsPreventsPaymentReuse() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let cp = ConsensusParams.regtest
+
+        // Register two names that both need dev fund payment
+        let name1 = "claimone"
+        let name2 = "claimtwo"
+        let nh1 = nameHash(for: name1)
+        let nh2 = nameHash(for: name2)
+        let openHeight = 0
+        let height = 5 // below regtest renewalMaturity (10) so zeroed blockHash passes
+
+        let ownerOp1 = outpoint(0x81, 0)
+        let ownerOp2 = outpoint(0x82, 0)
+
+        // Set up name1 with a non-zero value so payment is required
+        var ns1 = NameState(nameHash: nh1, name: Array(name1.utf8))
+        ns1.height = openHeight
+        ns1.renewal = openHeight
+        ns1.registered = true // enables early .closed state at low heights
+        ns1.owner = NameState.Outpoint(hash: txHash(0x81).bytes, index: 0)
+        ns1.value = 1000
+        ns1.highest = 2000
+        db.putNameState(nh1, ns1)
+
+        // Set up name2 with a non-zero value so payment is required
+        var ns2 = NameState(nameHash: nh2, name: Array(name2.utf8))
+        ns2.height = openHeight
+        ns2.renewal = openHeight
+        ns2.registered = true // enables early .closed state at low heights
+        ns2.owner = NameState.Outpoint(hash: txHash(0x82).bytes, index: 0)
+        ns2.value = 1000
+        ns2.highest = 2000
+        db.putNameState(nh2, ns2)
+
+        let revealCov1 = CovenantData.makeReveal(
+            nameHash: nh1, startHeight: openHeight,
+            nonce: BidNonce(unchecked: [UInt8](repeating: 0x01, count: 32))
+        )
+        let revealCov2 = CovenantData.makeReveal(
+            nameHash: nh2, startHeight: openHeight,
+            nonce: BidNonce(unchecked: [UInt8](repeating: 0x02, count: 32))
+        )
+        let registerCov1 = CovenantData.makeRegister(
+            nameHash: nh1, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let registerCov2 = CovenantData.makeRegister(
+            nameHash: nh2, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+
+        let devFundAddr = Address(unchecked: cp.devFundVersion, hash: cp.devFundAddress)
+        // regtest registrationBurnPercent = 50, so devShare = value * 50 / 100 = 500
+        // Only ONE dev fund payment output (should be claimed by first REGISTER)
+        let tx = Transaction(
+            inputs: [
+                Input(prevout: ownerOp1),
+                Input(prevout: ownerOp2),
+            ],
+            outputs: [
+                Output(value: 0, address: .null, covenant: registerCov1),
+                Output(value: 0, address: .null, covenant: registerCov2),
+                Output(value: 500, address: devFundAddr, covenant: .none), // single payment
+                Output(value: 500, address: .null, covenant: .none), // burn for first
+            ]
+        )
+        var view = CoinView()
+        view.addEntry(ownerOp1, CoinEntry.fromOutput(
+            Output(value: 1000, address: .null, covenant: revealCov1),
+            height: 1, coinbase: false))
+        view.addEntry(ownerOp2, CoinEntry.fromOutput(
+            Output(value: 1000, address: .null, covenant: revealCov2),
+            height: 1, coinbase: false))
+
+        // Second REGISTER should fail because the dev fund payment was already claimed
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: cp
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            // Should fail on burn or dev fund insufficient for the second register
+            switch covErr {
+            case .devFundPaymentInsufficient, .burnPaymentInsufficient:
+                break // expected
+            default:
+                XCTFail("Expected payment insufficient error, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: UPDATE rejects address mismatch
+
+    func testUpdateRejectsAddressMismatch() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "addrmis"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        let ownerOp = outpoint(0x61, 0)
+        let inputAddr = Address(unchecked: 0, hash: [UInt8](repeating: 0x11, count: 20))
+        let outputAddr = Address(unchecked: 0, hash: [UInt8](repeating: 0x22, count: 20))
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(0x61).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        db.putNameState(nh, ns)
+
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let updateCov = CovenantData.makeUpdate(nameHash: nh, startHeight: openHeight, resource: [])
+
+        // Input coin has inputAddr, output has different outputAddr
+        let tx = Transaction(
+            inputs: [Input(prevout: ownerOp)],
+            outputs: [Output(value: 1000, address: outputAddr, covenant: updateCov)]
+        )
+        let inputOutput = Output(value: 1000, address: inputAddr, covenant: registerCov)
+        let entry = CoinEntry.fromOutput(inputOutput, height: 100, coinbase: false)
+        var view = CoinView()
+        view.addEntry(ownerOp, entry)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: closedHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("address mismatch"), "Got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState with address mismatch, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: maybeExpire resets state
+
+    func testMaybeExpireResetsState() throws {
+        let name = "expirethis"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(0xBB).bytes, index: 0)
+        ns.value = 5000
+        ns.highest = 10000
+        ns.data = [1, 2, 3]
+
+        // Advance past the renewal window
+        let expiredHeight = openHeight + nameParams.renewalWindow + 1
+
+        // Verify name is expired
+        XCTAssertTrue(ns.isExpired(at: expiredHeight, params: nameParams))
+
+        // Apply maybeExpire
+        let didExpire = ns.maybeExpire(at: expiredHeight, params: nameParams)
+        XCTAssertTrue(didExpire)
+
+        // State should be reset
+        XCTAssertEqual(ns.height, expiredHeight)
+        XCTAssertEqual(ns.renewal, expiredHeight)
+        XCTAssertNil(ns.owner)
+        XCTAssertEqual(ns.value, 0)
+        XCTAssertEqual(ns.highest, 0)
+        XCTAssertFalse(ns.registered)
+        XCTAssertTrue(ns.expired)
+
+        // After expiry, name should be back in opening state
+        XCTAssertEqual(ns.state(at: expiredHeight, params: nameParams), .opening)
+    }
+
+    // MARK: - Edge Case: REGISTER deadline enforced
+
+    func testRegisterDeadlineEnforced() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "deadlined"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        let ownerOp = outpoint(0x90, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.owner = NameState.Outpoint(hash: txHash(0x90).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        // NOT yet registered
+        db.putNameState(nh, ns)
+
+        let deadlineHeight = ns.registerDeadlineHeight(params: nameParams)
+
+        let revealCov = CovenantData.makeReveal(
+            nameHash: nh, startHeight: openHeight,
+            nonce: .zero
+        )
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let tx = simpleTx(input: ownerOp, outputValue: 0, covenant: registerCov)
+        let view = viewWithCoin(at: ownerOp, value: 1000, covenant: revealCov)
+
+        // At exactly the deadline height, the deadline check should pass
+        // (it may still fail on renewal block validation since we use a dummy hash,
+        // but should NOT fail with "deadline has passed")
+        do {
+            try CovenantProcessor.processCovenants(
+                tx: tx, txIndex: 0, coinView: view, nameDB: db,
+                height: deadlineHeight, network: network, nameParams: nameParams,
+                chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+            )
+        } catch let error as CovenantsError {
+            if case .wrongAuctionState(let msg) = error {
+                XCTAssertFalse(msg.contains("deadline"),
+                    "Deadline check should pass at exactly the deadline height, got: \(msg)")
+            }
+        } catch {}
+
+        // One block after the deadline should fail with a deadline error
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: deadlineHeight + 1, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("deadline") || msg.contains("expired"),
+                              "Expected deadline-related message, got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: Renewal fee required
+
+    func testRenewalFeeRequired() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let cp = ConsensusParams.regtest
+        let name = "renewfee"
+        let nh = nameHash(for: name)
+        let openHeight = 0
+        let height = 5 // below regtest renewalMaturity (10) so zeroed blockHash passes
+
+        let ownerOp = outpoint(0x91, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true // enables early .closed state at low heights
+        ns.owner = NameState.Outpoint(hash: txHash(0x91).bytes, index: 0)
+        ns.value = 100_000 // High enough that 1% renewal fee > 0
+        ns.highest = 200_000
+        db.putNameState(nh, ns)
+
+        let registerCov = CovenantData.makeRegister(
+            nameHash: nh, startHeight: openHeight,
+            resource: [], blockHash: [UInt8](repeating: 0, count: 32)
+        )
+        let renewCov = CovenantData.makeRenew(
+            nameHash: nh, startHeight: openHeight,
+            blockHash: [UInt8](repeating: 0, count: 32)
+        )
+
+        // Transaction with NO dev fund payment output
+        let tx = simpleTx(input: ownerOp, outputValue: 100_000, covenant: renewCov)
+        let view = viewWithCoin(at: ownerOp, value: 100_000, covenant: registerCov, height: 1)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: height, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: cp
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .renewalFeeTooLow = covErr {
+                // Expected (individual validation)
+            } else if case .devFundPaymentInsufficient = covErr {
+                // Expected (deferred batch validation)
+            } else {
+                XCTFail("Expected renewalFeeTooLow or devFundPaymentInsufficient, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: Minimum bid enforced
+
+    func testMinimumBidEnforced() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "lowbid"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let bidHeight = openHeight + nameParams.openPeriod
+
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        db.putNameState(nh, ns)
+
+        XCTAssertEqual(ns.state(at: bidHeight, params: nameParams), .bidding)
+
+        // Use mainnet params where minimumBid > 0
+        let mainParams = NameParams.mainnet
+        let mainBidHeight = openHeight + mainParams.openPeriod
+
+        // Reset name state for mainnet timing
+        var nsMain = NameState(nameHash: nh, name: Array(name.utf8))
+        nsMain.height = openHeight
+        nsMain.renewal = openHeight
+        db.putNameState(nh, nsMain)
+
+        XCTAssertEqual(nsMain.state(at: mainBidHeight, params: mainParams), .bidding)
+
+        let minBid = mainParams.minimumBid(atHeight: mainBidHeight, rawName: Array(name.utf8))
+        // Ensure minimum bid is > 0 for this test to be meaningful
+        guard minBid > 0 else {
+            // If minimum bid is 0 on mainnet for this name, the test is not applicable.
+            // This should not happen for standard TLD names on mainnet.
+            return
+        }
+
+        let tooLowValue = UInt64(minBid - 1)
+        let blind = try BlindBid.blind(value: tooLowValue, nonce: BidNonce(unchecked: [UInt8](repeating: 0xEE, count: 32)))
+        let bidCov = CovenantData.makeBid(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8), blind: blind
+        )
+        let tx = simpleTx(input: outpoint(0x92, 0), outputValue: tooLowValue, covenant: bidCov)
+        let view = viewWithCoin(at: outpoint(0x92, 0), value: tooLowValue, covenant: .none)
+
+        let mainChain = try Chain(network: .main)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: mainBidHeight, network: .main, nameParams: mainParams,
+            chain: mainChain, consensusParams: ConsensusParams.params(for: .main)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .bidTooLow(let minimum, let actual) = covErr {
+                XCTAssertEqual(minimum, minBid)
+                XCTAssertEqual(actual, Int64(tooLowValue))
+            } else {
+                XCTFail("Expected bidTooLow, got \(covErr)")
+            }
+        }
+    }
+
+    // MARK: - Edge Case: FINALIZE rejects address mismatch with TRANSFER target
+
+    func testFinalizeRejectsAddressMismatch() throws {
+        let db = makeNameDB()
+        let chain = try makeChain()
+        let name = "finaddr"
+        let nh = nameHash(for: name)
+        let openHeight = 10
+        let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
+
+        let ownerOp = outpoint(0xA0, 0)
+        var ns = NameState(nameHash: nh, name: Array(name.utf8))
+        ns.height = openHeight
+        ns.renewal = openHeight
+        ns.registered = true
+        ns.owner = NameState.Outpoint(hash: txHash(0xA0).bytes, index: 0)
+        ns.value = 1000
+        ns.highest = 2000
+        ns.transfer = closedHeight // Transfer initiated at closedHeight
+        db.putNameState(nh, ns)
+
+        let finalizeHeight = closedHeight + nameParams.transferLockup
+
+        // TRANSFER covenant targets address 0xAA*20 with version 0
+        let transferAddrHash = [UInt8](repeating: 0xAA, count: 20)
+        let transferCov = CovenantData.makeTransfer(
+            nameHash: nh, startHeight: openHeight,
+            version: 0, addressHash: transferAddrHash
+        )
+
+        // FINALIZE output uses a DIFFERENT address hash (0xBB*20)
+        let mismatchedAddr = Address(unchecked: 0, hash: [UInt8](repeating: 0xBB, count: 20))
+        let finalizeCov = CovenantData.makeFinalize(
+            nameHash: nh, startHeight: openHeight,
+            name: Array(name.utf8), flags: 0,
+            claimed: 0, renewals: 0,
+            blockHash: [UInt8](repeating: 0, count: 32)
+        )
+
+        let tx = Transaction(
+            inputs: [Input(prevout: ownerOp)],
+            outputs: [Output(value: 1000, address: mismatchedAddr, covenant: finalizeCov)]
+        )
+        let view = viewWithCoin(at: ownerOp, value: 1000, covenant: transferCov)
+
+        XCTAssertThrowsError(try CovenantProcessor.processCovenants(
+            tx: tx, txIndex: 0, coinView: view, nameDB: db,
+            height: finalizeHeight, network: network, nameParams: nameParams,
+            chain: chain, consensusParams: ConsensusParams.params(for: .regtest)
+        )) { error in
+            guard let covErr = error as? CovenantsError else {
+                return XCTFail("Expected CovenantsError, got \(error)")
+            }
+            if case .wrongAuctionState(let msg) = covErr {
+                XCTAssertTrue(msg.contains("FINALIZE output address must match TRANSFER target"),
+                    "Expected TRANSFER target mismatch message, got: \(msg)")
+            } else {
+                XCTFail("Expected wrongAuctionState, got \(covErr)")
+            }
+        }
+    }
+}
