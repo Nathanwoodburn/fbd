@@ -84,8 +84,16 @@ public enum DNSSECProber {
     /// Sets the DO (DNSSEC OK) bit via an OPT record in the additional section.
     private static func queryRRset(name: String, type: DNSType, resolver: String) throws -> DNSSECProofLink {
         let queryData = try buildDNSSECQuery(name: name, type: type)
-        let responseData = try sendUDPQuery(data: queryData, resolver: resolver, port: 53)
-        let message = try DNSMessage.decode(from: responseData)
+        var responseData = try sendUDPQuery(data: queryData, resolver: resolver, port: 53)
+
+        // If the response is truncated (TC bit), retry over TCP.
+        // Some resolvers (e.g. Google 8.8.8.8) enforce small UDP payload
+        // limits and require TCP for large responses like root DNSKEY.
+        var message = try DNSMessage.decode(from: responseData)
+        if message.header.isTruncated {
+            responseData = try sendTCPQuery(data: queryData, resolver: resolver, port: 53)
+            message = try DNSMessage.decode(from: responseData)
+        }
 
         // Check for errors
         guard message.header.rcode == 0 else {
@@ -201,6 +209,51 @@ public enum DNSSECProber {
 
         guard !response.isEmpty else {
             throw DNSSECProberError.emptyResponse
+        }
+
+        return response
+    }
+
+    /// Send a DNS query over TCP and receive the response.
+    /// DNS-over-TCP prefixes each message with a 2-byte big-endian length.
+    private static func sendTCPQuery(data: [UInt8], resolver: String, port: Int, timeout: Int = 5) throws -> [UInt8] {
+        let sock = try SocketHandle.tcp()
+        defer { sock.close() }
+
+        #if os(Windows)
+        var timeoutMs: Int32 = Int32(timeout * 1000)
+        setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &timeoutMs, Int32(MemoryLayout<Int32>.size))
+        setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &timeoutMs, Int32(MemoryLayout<Int32>.size))
+        #else
+        var tv = timeval()
+        tv.tv_sec = timeout
+        tv.tv_usec = 0
+        setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        #endif
+
+        try sock.connect(host: resolver, port: port)
+
+        // Send length-prefixed message
+        let len = UInt16(data.count)
+        let prefix: [UInt8] = [UInt8(len >> 8), UInt8(len & 0xFF)]
+        try sock.send(prefix + data)
+
+        // Read 2-byte response length
+        var header = [UInt8]()
+        while header.count < 2 {
+            let chunk = try sock.recv(maxBytes: 2 - header.count)
+            guard !chunk.isEmpty else { throw DNSSECProberError.emptyResponse }
+            header.append(contentsOf: chunk)
+        }
+        let responseLen = Int(UInt16(header[0]) << 8 | UInt16(header[1]))
+
+        // Read full response
+        var response = [UInt8]()
+        while response.count < responseLen {
+            let chunk = try sock.recv(maxBytes: responseLen - response.count)
+            guard !chunk.isEmpty else { throw DNSSECProberError.emptyResponse }
+            response.append(contentsOf: chunk)
         }
 
         return response
