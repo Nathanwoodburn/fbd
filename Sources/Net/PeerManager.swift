@@ -97,9 +97,11 @@ public final class PeerManager: @unchecked Sendable {
     /// Addresses that recently failed connection — cooldown until timestamp + failure count.
     var failedAddresses: [String: (until: Double, count: Int)] = [:]
 
-    /// Base cooldown period for failed addresses (seconds). Doubles each failure, max 1 hour.
+    /// Base cooldown period for failed addresses (seconds). Doubles each failure.
     static let failCooldownBase: Double = 60
-    static let failCooldownMax: Double = 3600
+
+    /// After this many consecutive failures, remove the address from the pool entirely.
+    static let maxFailCount = 5
 
     /// Addresses confirmed to be ourselves (via nonce detection). Never connect to these.
     var selfAddresses = Set<String>()
@@ -594,6 +596,20 @@ extension PeerManager: PeerMessageDelegate {
            let ip = addr.ipv4String {
             let port = peerContext.state.listenPort > 0 ? Int(peerContext.state.listenPort) : Int(addr.port)
             seedAddresses.append((host: ip, port: port))
+        }
+
+        // Apply backoff to outbound peers that failed before handshake.
+        // After maxFailCount consecutive failures, evict from the pool entirely.
+        if peerContext.outbound && !peerContext.state.isHandshaked {
+            let prev = failedAddresses[addrStr]?.count ?? 0
+            let newCount = prev + 1
+            if newCount >= Self.maxFailCount {
+                addressPool.removeValue(forKey: addrStr)
+                failedAddresses.removeValue(forKey: addrStr)
+            } else {
+                let backoff = Self.failCooldownBase * pow(2.0, Double(prev))
+                failedAddresses[addrStr] = (until: Date().timeIntervalSinceReferenceDate + backoff, count: newCount)
+            }
         }
 
         lock.unlock()

@@ -136,8 +136,14 @@ extension PeerManager {
                 self.lock.lock()
                 self.dialedAddresses.remove(addr)
                 let prev = self.failedAddresses[addr]?.count ?? 0
-                let backoff = min(Self.failCooldownBase * pow(2.0, Double(prev)), Self.failCooldownMax)
-                self.failedAddresses[addr] = (until: Date().timeIntervalSinceReferenceDate + backoff, count: prev + 1)
+                let newCount = prev + 1
+                if newCount >= Self.maxFailCount {
+                    self.addressPool.removeValue(forKey: addr)
+                    self.failedAddresses.removeValue(forKey: addr)
+                } else {
+                    let backoff = Self.failCooldownBase * pow(2.0, Double(prev))
+                    self.failedAddresses[addr] = (until: Date().timeIntervalSinceReferenceDate + backoff, count: newCount)
+                }
                 self.lock.unlock()
                 self.logger.warning("Connection failed", metadata: [
                     "address": "\(addr)",
@@ -178,8 +184,14 @@ extension PeerManager {
                 self.lock.lock()
                 self.dialedAddresses.remove(addr)
                 let prev = self.failedAddresses[addr]?.count ?? 0
-                let backoff = min(Self.failCooldownBase * pow(2.0, Double(prev)), Self.failCooldownMax)
-                self.failedAddresses[addr] = (until: Date().timeIntervalSinceReferenceDate + backoff, count: prev + 1)
+                let newCount = prev + 1
+                if newCount >= Self.maxFailCount {
+                    self.addressPool.removeValue(forKey: addr)
+                    self.failedAddresses.removeValue(forKey: addr)
+                } else {
+                    let backoff = Self.failCooldownBase * pow(2.0, Double(prev))
+                    self.failedAddresses[addr] = (until: Date().timeIntervalSinceReferenceDate + backoff, count: newCount)
+                }
                 self.lock.unlock()
                 self.logger.warning("Connection failed", metadata: [
                     "address": "\(addr)",
