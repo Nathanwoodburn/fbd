@@ -599,7 +599,11 @@ public final class Chain: @unchecked Sendable {
             try nameDB.rollbackToHeight(height, treeInterval: nameParams.treeInterval)
         }
 
-        for h in stride(from: _tip.height, through: height + 1, by: -1) {
+        // Start from the highest stored block, not the header tip. The header
+        // chain may be ahead of the block store (e.g., after restart when a header
+        // was persisted but its block was never stored/connected to UTXO).
+        let disconnectFrom = min(_tip.height, blockStore.storedCount - 1)
+        for h in stride(from: disconnectFrom, through: height + 1, by: -1) {
             guard let block = try blockStore.loadBlock(height: h) else {
                 throw ChainError.validationFailed("missing block at height \(h) for disconnect")
             }
