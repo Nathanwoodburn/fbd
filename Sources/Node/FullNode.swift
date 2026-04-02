@@ -721,32 +721,9 @@ public final class FullNode: Sendable {
         peerManager.startOutboundConnections()
         peerManager.startPeriodicTasks()
 
-        // Start CPU miner if --miner-address is set (and no Stratum pool)
+        // Start CPU miner if --miner-address is set
         var minerTask: Task<Void, Never>?
-        var stratumServer: StratumServer?
-        if config.stratumPort != 0, let minerAddr = ctx.minerAddress {
-            // Stratum pool mode — don't start CPU miner
-            let stratum = StratumServer(
-                chain: chain,
-                mempool: mempool,
-                address: minerAddr,
-                password: config.stratumPassword,
-                logger: logger,
-                onBlockMined: { [ctx] block, entry in
-                    ctx.peerManager?.syncDidConnectBlock(
-                        hash: entry.hash, header: block.header, proof: block.balloonProof, fromPeer: nil
-                    )
-                    let reward = block.transactions.first.map { $0.outputs.reduce(0) { $0 + $1.value } } ?? 0
-                    ctx.emitEvent("{\"type\":\"mined\",\"height\":\(entry.height),\"reward\":\(reward)}")
-                }
-            )
-            do {
-                try stratum.start(host: config.stratumHost, port: Int(config.effectiveStratumPort))
-                stratumServer = stratum
-            } catch {
-                logger.error("Cannot bind Stratum on \(config.stratumHost):\(config.effectiveStratumPort) — \(Self.describeBindError(error))", source: "Stratum")
-            }
-        } else if let minerAddr = ctx.minerAddress, config.network != .regtest && config.network != .simnet {
+        if let minerAddr = ctx.minerAddress, config.network != .regtest && config.network != .simnet {
             let miner = CPUMiner(
                 chain: chain,
                 mempool: mempool,
@@ -771,7 +748,6 @@ public final class FullNode: Sendable {
         logger.info("Shutting down...")
         minerTask?.cancel()
         await minerTask?.value
-        stratumServer?.shutdown()
         await peerManager.shutdown()
         rpcServer.shutdown()
         dnsServer.shutdown()

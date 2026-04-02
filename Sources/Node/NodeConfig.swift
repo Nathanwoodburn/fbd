@@ -71,17 +71,6 @@ public struct NodeConfig: Sendable {
     /// The number of CPU miner threads (0 = all cores - 1).
     public let minerThreads: Int
 
-    // MARK: - Stratum
-
-    /// The Stratum pool listen host.
-    public let stratumHost: String
-
-    /// The Stratum pool listen port (0 = disabled).
-    public let stratumPort: UInt16
-
-    /// The Stratum pool password (nil = no auth).
-    public let stratumPassword: String?
-
     // MARK: - Logging
 
     /// The log level.
@@ -128,9 +117,6 @@ public struct NodeConfig: Sendable {
         nsPort: UInt16 = 0,
         minerAddress: String? = nil,
         minerThreads: Int = 0,
-        stratumHost: String = "0.0.0.0",
-        stratumPort: UInt16 = 0,
-        stratumPassword: String? = nil,
         logLevel: Logger.Level = .info,
         indexTx: Bool = false,
         indexAddress: Bool = false,
@@ -153,9 +139,6 @@ public struct NodeConfig: Sendable {
         self.nsPort = nsPort
         self.minerAddress = minerAddress
         self.minerThreads = minerThreads
-        self.stratumHost = stratumHost
-        self.stratumPort = stratumPort
-        self.stratumPassword = stratumPassword
         self.logLevel = logLevel
         self.indexTx = indexTx
         self.indexAddress = indexAddress
@@ -175,11 +158,6 @@ public struct NodeConfig: Sendable {
     /// The effective DNS port (config value or network default).
     public var effectiveNSPort: UInt16 {
         nsPort != 0 ? nsPort : network.nsPort
-    }
-
-    /// The effective Stratum port (config value or network default).
-    public var effectiveStratumPort: UInt16 {
-        stratumPort != 0 ? stratumPort : network.stratumPort
     }
 
     /// The data directory for this specific network.

@@ -109,17 +109,6 @@ struct FBD: AsyncParsableCommand {
     @Option(name: .long, help: "Number of CPU miner threads (0 = auto, max = cores - 1).")
     var minerThreads: Int?
 
-    // MARK: - Stratum
-
-    @Option(name: .long, help: "Stratum pool listen host.")
-    var stratumHost: String?
-
-    @Option(name: .long, help: "Stratum pool listen port (0 = disabled).")
-    var stratumPort: Int?
-
-    @Option(name: .long, help: "Stratum pool password.")
-    var stratumPassword: String?
-
     // MARK: - Logging
 
     @Option(name: .long, help: "Log level: trace, debug, info, notice, warning, error, critical.")
@@ -197,9 +186,7 @@ struct FBD: AsyncParsableCommand {
         let finalNsPort = nsPort ?? conf["ns-port"].flatMap(Int.init) ?? 0
         let finalMinerAddress = minerAddress ?? conf["miner-address"]
         let finalMinerThreads = minerThreads ?? conf["miner-threads"].flatMap(Int.init) ?? 0
-        let finalStratumHost = stratumHost ?? conf["stratum-host"] ?? "0.0.0.0"
-        let finalStratumPort = stratumPort ?? conf["stratum-port"].flatMap(Int.init) ?? 0
-        let finalStratumPassword = stratumPassword ?? conf["stratum-password"]
+
         let finalLogLevel = logLevel ?? conf["log-level"] ?? "info"
         let finalIndexTx = indexTx || conf["index-tx"] == "true"
         let finalIndexAddress = indexAddress || conf["index-address"] == "true"
@@ -232,9 +219,7 @@ struct FBD: AsyncParsableCommand {
             nsPort: UInt16(clamping: finalNsPort),
             minerAddress: finalMinerAddress,
             minerThreads: finalMinerThreads,
-            stratumHost: finalStratumHost,
-            stratumPort: UInt16(clamping: finalStratumPort),
-            stratumPassword: finalStratumPassword,
+
             logLevel: level,
             indexTx: finalIndexTx,
             indexAddress: finalIndexAddress,
