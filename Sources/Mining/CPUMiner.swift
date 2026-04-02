@@ -102,8 +102,10 @@ public final class CPUMiner: Sendable {
                     // Stale block — tip changed while we were mining, just retry
                     self.logger.debug("Stale mined block, retrying", source: "Miner")
                 } catch let error as BlockStoreError {
-                    // Height mismatch from block store — also a stale block race
-                    self.logger.debug("Stale mined block (\(error)), retrying", source: "Miner")
+                    // Height mismatch from block store — block sync likely in progress.
+                    // Wait for sync to catch up before retrying.
+                    self.logger.debug("Stale mined block (\(error)), waiting for sync", source: "Miner")
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
                 } catch {
                     self.logger.error("Mining error: \(error)", source: "Miner")
                     // Evict offending transactions to prevent repeated failures
@@ -118,6 +120,13 @@ public final class CPUMiner: Sendable {
 
     /// Mine a single block on the current tip using all threads.
     private func mineNextBlock() async throws {
+        // Don't mine while block sync is in progress — the block store is behind
+        // the header tip, so connectBlock would fail with heightMismatch.
+        if chain.storedHeight < chain.tip.height {
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            return
+        }
+
         let tip = chain.tip
         let bits = chain.getNextBits()
         let treeRoot = try chain.getCurrentTreeRoot()
@@ -268,7 +277,10 @@ public final class CPUMiner: Sendable {
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     // Re-check tip before connecting — a peer block may have arrived
-                    guard chain.tip.hash == tipHash else {
+                    // Also verify blocks are fully synced to prevent adding entries
+                    // that can't be connected (storedHeight would fall behind tip).
+                    guard chain.tip.hash == tipHash,
+                          chain.storedHeight >= chain.tip.height else {
                         cont.resume(returning: nil)
                         return
                     }

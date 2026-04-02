@@ -171,6 +171,35 @@ public final class Chain: @unchecked Sendable {
         return blockStore.storedCount - 1
     }
 
+    /// Reset the chain tip to `storedHeight`, removing entries above it.
+    ///
+    /// Used when the tip has advanced via headers but block data is missing
+    /// (e.g. miner added entries that couldn't be connected, or sync peer
+    /// disconnected before block download completed). After this call the
+    /// node will re-sync headers from peers to discover the correct chain.
+    public func resetToStoredHeight() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let blockStore = blockStore else { return }
+        let target = blockStore.storedCount - 1
+        guard target >= 0, target < _tip.height else { return }
+        guard let entry = byHeight[target] else { return }
+
+        // Remove in-memory entries above the stored height
+        for h in (target + 1)..._tip.height {
+            if let e = byHeight.removeValue(forKey: h) {
+                byHash.removeValue(forKey: e.hash)
+            }
+        }
+
+        // Truncate persistent entry store
+        try store?.truncateToHeight(target)
+        persistedHeight = target
+
+        stateCache.removeAll()
+        _tip = entry
+    }
+
     /// Initialize the chain with the genesis block, optionally loading from a store.
     public init(network: NetworkType, store: ChainStore? = nil, blockStore: BlockStore? = nil, coinDB: CoinDatabase? = nil, treeDir: String? = nil, txIndexPath: String? = nil, addrIndexPath: String? = nil) throws {
         self.network = network

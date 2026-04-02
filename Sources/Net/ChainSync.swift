@@ -674,6 +674,28 @@ public final class ChainSync: @unchecked Sendable {
             let tipHeight = UInt32(chain.tip.height)
             if let newPeer = peers.first(where: { $0.state.height > tipHeight }) {
                 startSync(peer: newPeer)
+                return
+            }
+
+            // No peer is ahead of our tip, but blocks are missing — the
+            // entries above storedHeight are orphaned (e.g. miner added
+            // headers it couldn't connect). Reset to storedHeight so header
+            // sync can rediscover the correct chain from peers.
+            if chain.storedHeight < chain.tip.height {
+                logger.warning("Resetting chain to stored height (orphaned entries)", metadata: [
+                    "stored": "\(chain.storedHeight)",
+                    "tip": "\(chain.tip.height)",
+                ])
+                do {
+                    try chain.resetToStoredHeight()
+                } catch {
+                    logger.error("Failed to reset chain to stored height: \(error)")
+                }
+
+                // Re-sync headers from an available peer
+                if let peer = peers.first(where: { $0.state.isHandshaked }) {
+                    startSync(peer: peer)
+                }
             }
         }
     }

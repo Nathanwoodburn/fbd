@@ -88,6 +88,11 @@ extension Chain {
             for tx in block.transactions {
                 view.addTX(tx, height: 0)
             }
+            // Store genesis block before UTXO commit
+            if let blockStore = blockStore, !blockStore.hasBlock(height: 0) {
+                try coinDB.markPendingHeight(0)
+                try blockStore.storeBlock(block, height: 0)
+            }
             try coinDB.saveView(view, height: 0, hash: entry.hash)
 
             // Register genesis names in the name database
@@ -272,12 +277,19 @@ extension Chain {
             // Capture undo coins for address indexing before persist
             undoCoins = view.undo
 
-            // Persist: coins + undo + state (single atomic write)
-            try coinDB.saveView(view, height: height, hash: entry.hash)
-        }
+            // Store block to disk BEFORE committing UTXO changes. If the block
+            // write fails, no UTXO changes are committed. If the block succeeds
+            // but saveView fails (crash), coinsBehind recovery handles it on
+            // restart. The sentinel is cleared atomically by saveView.
+            if let blockStore = blockStore, !blockStore.hasBlock(height: height) {
+                try coinDB.markPendingHeight(height)
+                try blockStore.storeBlock(block, height: height)
+            }
 
-        // Store to disk (skip if already stored, e.g. during reindex)
-        if let blockStore = blockStore, !blockStore.hasBlock(height: height) {
+            // Persist: coins + undo + state (clears pending sentinel atomically)
+            try coinDB.saveView(view, height: height, hash: entry.hash)
+        } else if let blockStore = blockStore, !blockStore.hasBlock(height: height) {
+            // No coinDB (header-only mode) — still store the block
             try blockStore.storeBlock(block, height: height)
         }
 

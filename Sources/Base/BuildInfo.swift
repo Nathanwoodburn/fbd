@@ -1,3 +1,2 @@
-/// Auto-generated at build time by install scripts.
-/// Fallback value used when building as a library dependency.
-let _buildHash: String = "unknown"
+/// Auto-generated at build time — do not edit.
+let _buildHash: String = "8704bd8"

@@ -34,6 +34,19 @@ public final class CoinDatabase: @unchecked Sendable {
     /// The meta-key used to store committed height.
     private static let heightKey: [UInt8] = Array("height".utf8)
 
+    /// Sentinel key: records the height of a block write in progress.
+    /// Set before the flat-file write, cleared atomically with saveView.
+    /// If present on startup, a block was written but UTXO was not committed.
+    private static let pendingHeightKey: [UInt8] = Array("pending".utf8)
+
+    /// Height of an in-flight block write, if any (nil = no pending write).
+    private var _pendingHeight: Int?
+    public var pendingHeight: Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _pendingHeight
+    }
+
     /// Open or create a coin database at the given path.
     ///
     /// - Parameters:
@@ -60,6 +73,14 @@ public final class CoinDatabase: @unchecked Sendable {
                 | UInt32(data[2]) << 16
                 | UInt32(data[3]) << 24)
         }
+
+        // Load pending height sentinel
+        if let data = try store.get(db: metaDB, key: Self.pendingHeightKey), data.count >= 4 {
+            _pendingHeight = Int(UInt32(data[0])
+                | UInt32(data[1]) << 8
+                | UInt32(data[2]) << 16
+                | UInt32(data[3]) << 24)
+        }
     }
 
     /// Reset the entire coin database (coins, undo data, and state).
@@ -73,9 +94,25 @@ public final class CoinDatabase: @unchecked Sendable {
         let batch: [(db: UInt8, op: LevelDBStore.BatchOp)] = [
             (metaDB, .put(key: Self.stateKey, value: state.serialize())),
             (metaDB, .delete(key: Self.heightKey)),
+            (metaDB, .delete(key: Self.pendingHeightKey)),
         ]
         try store.writeBatch(batch)
         _committedHeight = -1
+        _pendingHeight = nil
+    }
+
+    /// Record that a block at `height` is about to be written to the block store.
+    /// Must be called before the flat-file write. Cleared atomically by `saveView`.
+    public func markPendingHeight(_ height: Int) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let h = UInt32(height)
+        let val: [UInt8] = [
+            UInt8(h & 0xFF), UInt8((h >> 8) & 0xFF),
+            UInt8((h >> 16) & 0xFF), UInt8((h >> 24) & 0xFF),
+        ]
+        try store.writeBatch([(metaDB, .put(key: Self.pendingHeightKey, value: val))])
+        _pendingHeight = height
     }
 
     // MARK: - Coin Operations
@@ -159,6 +196,9 @@ public final class CoinDatabase: @unchecked Sendable {
         ]
         batch.append((metaDB, .put(key: Self.heightKey, value: heightVal)))
 
+        // Clear the pending-height sentinel atomically with the UTXO commit.
+        batch.append((metaDB, .delete(key: Self.pendingHeightKey)))
+
         // Atomic write (rollback state on failure)
         do {
             try store.writeBatch(batch)
@@ -167,6 +207,7 @@ public final class CoinDatabase: @unchecked Sendable {
             throw error
         }
         _committedHeight = height
+        _pendingHeight = nil
     }
 
     /// Retrieve undo data for a given block height.

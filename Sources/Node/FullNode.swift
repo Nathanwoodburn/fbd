@@ -172,15 +172,33 @@ public final class FullNode: Sendable {
         var coinDB = try CoinDatabase(path: coinsDir, network: config.network)
         let storedCount = blockStore.storedCount
 
+        // Detect incomplete block writes via the pending-height sentinel.
+        // If present, a block was written to disk but the UTXO batch didn't
+        // commit — force reindex regardless of arithmetic.
+        let pendingWriteIncomplete = coinDB.pendingHeight != nil
+        if pendingWriteIncomplete {
+            logger.info("Pending block write detected (crash during write), forcing reindex", metadata: [
+                "pending_height": "\(coinDB.pendingHeight!)",
+                "coin_height": "\(coinDB.committedHeight)",
+                "stored_blocks": "\(storedCount)",
+            ], source: "Chain")
+        }
+
         let coinsBehind: Bool
         if coinDB.committedHeight >= 0 {
-            coinsBehind = storedCount > 0 && coinDB.committedHeight < storedCount - 1
+            coinsBehind = pendingWriteIncomplete
+                || (storedCount > 0 && coinDB.committedHeight < storedCount - 1)
         } else {
             coinsBehind = storedCount > 100 && coinDB.coinCount < 100
         }
 
-        if coinsBehind {
-            logger.info("Coin database behind block store, resetting for reindex...", metadata: [
+        // Also detect coin DB ahead of block store (legacy: before write-order
+        // swap, connectBlock could commit UTXO before the block was stored).
+        let coinsAhead = storedCount > 0 && coinDB.committedHeight >= 0
+            && coinDB.committedHeight > storedCount - 1
+
+        if coinsBehind || coinsAhead {
+            logger.info("Coin database \(coinsAhead ? "ahead of" : "behind") block store, resetting for reindex...", metadata: [
                 "coin_height": "\(coinDB.committedHeight)",
                 "stored_blocks": "\(storedCount)",
             ], source: "Chain")
@@ -235,6 +253,17 @@ public final class FullNode: Sendable {
             let genesisBlock = Genesis.block(for: config.network)
             try chain.connectBlock(genesisBlock, height: 0)
             logger.info("Genesis block connected", source: "Chain")
+        }
+
+        // If chain tip is ahead of block store (orphaned entries from miner or
+        // incomplete sync), reset to stored height so reindex and peer sync
+        // start from a consistent state.
+        if chain.tip.height > chain.storedHeight && chain.storedHeight >= 0 {
+            logger.info("Chain tip ahead of block store, resetting to stored height...", metadata: [
+                "tip": "\(chain.tip.height)",
+                "stored": "\(chain.storedHeight)",
+            ], source: "Chain")
+            try chain.resetToStoredHeight()
         }
 
         // If block store is ahead of header chain (unclean shutdown), replay headers
