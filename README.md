@@ -11,7 +11,7 @@ macOS, Linux, Windows.
 ## Clone
 
 ```
-git clone https://github.com/eskimo/fbd.git
+git clone https://github.com/fistbump-org/fbd.git
 cd fbd
 ```
 
