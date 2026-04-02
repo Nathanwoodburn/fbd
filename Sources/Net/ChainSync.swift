@@ -278,7 +278,7 @@ public final class ChainSync: @unchecked Sendable {
 
         // Log sync progress (only during initial sync, not single block announcements)
         if state == .syncingHeaders {
-            let pct = peerHeight > 0 ? Double(chain.tip.height) / Double(peerHeight) * 100 : 0
+            let pct = peerHeight > 0 ? min(Double(chain.tip.height) / Double(peerHeight) * 100, 100) : 0
             logger.info("Headers: \(chain.tip.height)/\(peerHeight) (\(String(format: "%.3f", pct))%) count=\(headers.count) peer=\(peer.id)")
         }
 
