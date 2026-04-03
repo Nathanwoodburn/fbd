@@ -33,6 +33,9 @@ public final class NodeContext: @unchecked Sendable {
     /// Configured miner thread count (0 = auto).
     public var minerThreads: Int = 0
 
+    /// Current miner hash rate (hashes/sec). Updated periodically by the CPU miner.
+    public var hashRate: Double = 0
+
     /// Lock protecting `wallets` and `rescanProgress`.
     private let lock = NSLock()
 

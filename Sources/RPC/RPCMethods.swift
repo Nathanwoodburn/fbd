@@ -161,7 +161,8 @@ public enum RPCMethods {
         bits: UInt32,
         pooledtx: Int,
         cpuCount: Int = 0,
-        minerThreads: Int = 0
+        minerThreads: Int = 0,
+        hashRate: Double = 0
     ) -> JSONValue {
         .object([
             ("blocks", .int(Int64(height))),
@@ -169,6 +170,8 @@ public enum RPCMethods {
             ("pooledtx", .int(Int64(pooledtx))),
             ("cpus", .int(Int64(cpuCount))),
             ("minerThreads", .int(Int64(minerThreads))),
+            ("hashrate", .double(hashRate)),
+            ("sph", .double(hashRate > 0 ? 1.0 / hashRate : 0)),
         ])
     }
 

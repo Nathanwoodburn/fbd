@@ -765,6 +765,15 @@ public final class FullNode: Sendable {
                     )
                     let reward = block.transactions.first.map { $0.outputs.reduce(0) { $0 + $1.value } } ?? 0
                     ctx.emitEvent("{\"type\":\"mined\",\"height\":\(entry.height),\"reward\":\(reward)}")
+                },
+                onHashRate: { [ctx] hashRate, hashes, elapsed in
+                    // Skip updates until the first hash completes — Balloon hashes
+                    // take several seconds, so the counter is 0 between template restarts.
+                    guard hashes > 0, hashRate > 0 else { return }
+                    ctx.hashRate = hashRate
+                    let sph = String(format: "%.1f", 1.0 / hashRate)
+                    let el = String(format: "%.1f", elapsed)
+                    ctx.emitEvent("{\"type\":\"hashrate\",\"sph\":\(sph),\"hashes\":\(hashes),\"elapsed\":\(el)}")
                 }
             )
             minerTask = miner.start()

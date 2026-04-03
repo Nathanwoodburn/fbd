@@ -23,14 +23,15 @@ extension FullNode {
 
         handlers["getmininginfo"] = { _ in
                 guard let chain = ctx.chain else {
-                    return RPCMethods.getMiningInfo(height: 0, bits: 0, pooledtx: 0, cpuCount: ctx.cpuCount, minerThreads: ctx.minerThreads)
+                    return RPCMethods.getMiningInfo(height: 0, bits: 0, pooledtx: 0, cpuCount: ctx.cpuCount, minerThreads: ctx.minerThreads, hashRate: ctx.hashRate)
                 }
                 return RPCMethods.getMiningInfo(
                     height: chain.height,
                     bits: chain.tip.bits,
                     pooledtx: ctx.mempool?.count ?? 0,
                     cpuCount: ctx.cpuCount,
-                    minerThreads: ctx.minerThreads
+                    minerThreads: ctx.minerThreads,
+                    hashRate: ctx.hashRate
                 )
             }
 

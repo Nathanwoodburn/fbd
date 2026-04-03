@@ -15,6 +15,8 @@ private final class MiningResult: @unchecked Sendable {
     private var _nonce: UInt64 = UInt64.max
     private var _stopped = false
 
+    private var _hashes: UInt64 = 0
+
     /// Try to claim a winning nonce. Returns true if this thread won.
     func claim(_ nonce: UInt32) -> Bool {
         lock.lock()
@@ -44,6 +46,20 @@ private final class MiningResult: @unchecked Sendable {
         defer { lock.unlock() }
         return _nonce == UInt64.max ? nil : UInt32(_nonce)
     }
+
+    /// Increment the shared hash counter (called by each thread).
+    func addHashes(_ count: UInt64) {
+        lock.lock()
+        _hashes += count
+        lock.unlock()
+    }
+
+    /// Read the total hash count across all threads.
+    var totalHashes: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _hashes
+    }
 }
 
 /// A continuous CPU miner that runs as a background task.
@@ -59,6 +75,7 @@ public final class CPUMiner: Sendable {
     private let logger: Logger
     private let threads: Int
     private let onBlockMined: @Sendable (Block, ChainEntry) -> Void
+    private let onHashRate: @Sendable (_ hashRate: Double, _ hashes: UInt64, _ elapsed: Double) -> Void
 
     /// Create a CPU miner.
     ///
@@ -69,13 +86,15 @@ public final class CPUMiner: Sendable {
     ///   - threads: Number of mining threads (0 = all cores).
     ///   - logger: Logger instance.
     ///   - onBlockMined: Callback invoked after each block is successfully mined and connected.
+    ///   - onHashRate: Callback invoked periodically with current hash rate (hashes/sec), total hashes, and elapsed seconds.
     public init(
         chain: Chain,
         mempool: Mempool,
         address: Address,
         threads: Int = 0,
         logger: Logger,
-        onBlockMined: @escaping @Sendable (Block, ChainEntry) -> Void
+        onBlockMined: @escaping @Sendable (Block, ChainEntry) -> Void,
+        onHashRate: @escaping @Sendable (_ hashRate: Double, _ hashes: UInt64, _ elapsed: Double) -> Void = { _, _, _ in }
     ) {
         self.chain = chain
         self.mempool = mempool
@@ -83,6 +102,7 @@ public final class CPUMiner: Sendable {
         self.threads = threads > 0 ? threads : max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
         self.logger = logger
         self.onBlockMined = onBlockMined
+        self.onHashRate = onHashRate
     }
 
     /// Start mining in a background task. Returns the task handle for cancellation.
@@ -93,9 +113,10 @@ public final class CPUMiner: Sendable {
                 "threads": "\(self.threads)",
             ], source: "Miner")
 
+            var lastRate: Double = 0
             while !Task.isCancelled {
                 do {
-                    try await self.mineNextBlock()
+                    lastRate = try await self.mineNextBlock(lastRate: lastRate)
                 } catch is CancellationError {
                     break
                 } catch HeaderError.headerMismatch, HeaderError.duplicateHeader {
@@ -119,12 +140,14 @@ public final class CPUMiner: Sendable {
     }
 
     /// Mine a single block on the current tip using all threads.
-    private func mineNextBlock() async throws {
+    /// Returns the hash rate achieved during this round.
+    @discardableResult
+    private func mineNextBlock(lastRate: Double = 0) async throws -> Double {
         // Don't mine while block sync is in progress — the block store is behind
         // the header tip, so connectBlock would fail with heightMismatch.
         if chain.storedHeight < chain.tip.height {
             try await Task.sleep(nanoseconds: 5_000_000_000)
-            return
+            return lastRate
         }
 
         let tip = chain.tip
@@ -139,7 +162,7 @@ public final class CPUMiner: Sendable {
             let wait = time - now - UInt64(params.maxFutureBlockTime)
             logger.info("Block timestamp too far in future, waiting \(wait)s", source: "Miner")
             try await Task.sleep(nanoseconds: UInt64(min(wait, 30)) * 1_000_000_000)
-            return
+            return lastRate
         }
 
         var template = try BlockAssembler.assemble(
@@ -173,11 +196,15 @@ public final class CPUMiner: Sendable {
         let templateTxCount = mempool.count
         let templateTime = Date()
 
-        logger.debug("Mining block \(tip.height + 1)", metadata: [
+        var miningMeta: Logger.Metadata = [
             "bits": "\(String(format: "0x%08x", bits))",
             "txs": "\(template.transactions.count + 1)",
             "threads": "\(threadCount)",
-        ], source: "Miner")
+        ]
+        if lastRate > 0 {
+            miningMeta["speed"] = "\(String(format: "%.1f", 1.0 / lastRate)) s/hash"
+        }
+        logger.debug("Mining block \(tip.height + 1)", metadata: miningMeta, source: "Miner")
 
         let result = MiningResult()
         let group = DispatchGroup()
@@ -208,6 +235,7 @@ public final class CPUMiner: Sendable {
                         return
                     }
                     hashes += 1
+                    result.addHashes(1)
                     if Target256(bigEndian: hash.bytes) <= target {
                         _ = result.claim(nonce)
                         logger.debug("Thread \(tid) found nonce \(nonce) after \(hashes) hashes", source: "Miner")
@@ -224,20 +252,28 @@ public final class CPUMiner: Sendable {
             }
         }
 
-        // Wait for threads, periodically checking for stale work
+        // Wait for threads, periodically checking for stale work and reporting hash rate
+        let onHashRate = self.onHashRate
         while true {
             let waitResult = group.wait(timeout: .now() + .seconds(5))
+
+            let elapsed = Date().timeIntervalSince(templateTime)
+            let totalHashes = result.totalHashes
+            let hashRate = elapsed > 0 ? Double(totalHashes) / elapsed : 0
+            onHashRate(hashRate, totalHashes, elapsed)
+            let currentRate = totalHashes > 0 ? hashRate : lastRate
+
             if waitResult == .success { break }
             if Task.isCancelled {
                 result.stop()
                 group.wait()
-                return
+                return currentRate
             }
             if chain.tip.hash != tip.hash {
                 logger.debug("Stale work, restarting", source: "Miner")
                 result.stop()
                 group.wait()
-                return
+                return currentRate
             }
             // Rebuild template if new mempool txs arrived (after 10s minimum)
             if mempool.count != templateTxCount
@@ -245,19 +281,23 @@ public final class CPUMiner: Sendable {
                 logger.debug("New mempool txs, rebuilding template", source: "Miner")
                 result.stop()
                 group.wait()
-                return
+                return currentRate
             }
         }
 
+        let currentRate = result.totalHashes > 0
+            ? (Date().timeIntervalSince(templateTime) > 0 ? Double(result.totalHashes) / Date().timeIntervalSince(templateTime) : lastRate)
+            : lastRate
+
         guard let winningNonce = result.winningNonce else {
             logger.debug("Nonce space exhausted, updating timestamp", source: "Miner")
-            return
+            return currentRate
         }
 
         // Check tip hasn't changed before expensive proof generation
         guard chain.tip.hash == tip.hash else {
             logger.debug("Stale block, tip changed before proof generation", source: "Miner")
-            return
+            return currentRate
         }
 
         let winHeader = BlockHeader(
@@ -305,7 +345,7 @@ public final class CPUMiner: Sendable {
 
         guard let mineResult else {
             logger.debug("Stale block, tip changed during proof generation", source: "Miner")
-            return
+            return currentRate
         }
         let block = mineResult.0
         let entry = mineResult.1
@@ -314,9 +354,11 @@ public final class CPUMiner: Sendable {
             "hash": "\(entry.hash.hex)",
             "txs": "\(block.transactions.count)",
             "nonce": "\(winningNonce)",
+            "speed": "\(currentRate > 0 ? String(format: "%.1f", 1.0 / currentRate) : "0") s/hash",
         ], source: "Miner")
 
         onBlockMined(block, entry)
+        return currentRate
     }
 
     /// Remove mempool transactions that would fail block validation.
