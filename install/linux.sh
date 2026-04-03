@@ -86,11 +86,94 @@ detect_distro() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         DISTRO_ID="${ID}"
-        DISTRO_VERSION="${VERSION_ID}"
+        DISTRO_VERSION="${VERSION_ID:-rolling}"
         DISTRO_NAME="${PRETTY_NAME}"
+        DISTRO_ID_LIKE="${ID_LIKE:-}"
+        DISTRO_UBUNTU_CODENAME="${UBUNTU_CODENAME:-}"
     else
         die "cannot detect Linux distribution (no /etc/os-release)"
     fi
+    resolve_distro
+}
+
+# Resolve derivative distros to a supported base
+resolve_distro() {
+    local original="${DISTRO_NAME}"
+    case "${DISTRO_ID}" in
+        ubuntu|debian|fedora|amzn|rhel|centos)
+            return ;;
+        linuxmint|mint|pop|elementary|zorin|neon|tuxedo)
+            DISTRO_ID="ubuntu"
+            map_ubuntu_codename "${original}"
+            ;;
+        rocky|almalinux|ol|miraclelinux|scientific)
+            info "Mapping ${original} → RHEL (UBI 9)"
+            DISTRO_ID="rhel"
+            ;;
+        opensuse-leap|opensuse-tumbleweed|sles)
+            info "Mapping ${original} → openSUSE"
+            DISTRO_ID="opensuse"
+            ;;
+        arch|manjaro|endeavouros|garuda|artix)
+            info "Mapping ${original} → Arch Linux"
+            DISTRO_ID="arch"
+            ;;
+        *)
+            if ! resolve_by_id_like "${original}"; then
+                die "unsupported distribution: ${DISTRO_ID}\n  Supported: ubuntu, debian, fedora, rhel/rocky/alma, amazon linux, arch, opensuse (and derivatives)\n  Tip: install Swift manually and re-run with --skip-swift"
+            fi
+            ;;
+    esac
+}
+
+map_ubuntu_codename() {
+    local original="$1"
+    if [ -n "${DISTRO_UBUNTU_CODENAME}" ]; then
+        case "${DISTRO_UBUNTU_CODENAME}" in
+            focal)    DISTRO_VERSION="20.04" ;;
+            jammy)    DISTRO_VERSION="22.04" ;;
+            noble)    DISTRO_VERSION="24.04" ;;
+            oracular) DISTRO_VERSION="24.10" ;;
+            *)        DISTRO_VERSION="24.04" ;;
+        esac
+    else
+        DISTRO_VERSION="24.04"
+    fi
+    info "Mapping ${original} → Ubuntu ${DISTRO_VERSION}"
+}
+
+resolve_by_id_like() {
+    local original="$1"
+    for like in ${DISTRO_ID_LIKE}; do
+        case "$like" in
+            ubuntu)
+                DISTRO_ID="ubuntu"
+                map_ubuntu_codename "${original}"
+                return 0 ;;
+            debian)
+                DISTRO_ID="debian"
+                DISTRO_VERSION="${DISTRO_VERSION%%.*}"
+                info "Mapping ${original} → Debian ${DISTRO_VERSION}"
+                return 0 ;;
+            rhel|centos)
+                DISTRO_ID="rhel"
+                info "Mapping ${original} → RHEL (UBI 9)"
+                return 0 ;;
+            fedora)
+                DISTRO_ID="fedora"
+                info "Mapping ${original} → Fedora"
+                return 0 ;;
+            suse|opensuse)
+                DISTRO_ID="opensuse"
+                info "Mapping ${original} → openSUSE"
+                return 0 ;;
+            arch)
+                DISTRO_ID="arch"
+                info "Mapping ${original} → Arch Linux"
+                return 0 ;;
+        esac
+    done
+    return 1
 }
 
 # Map distro to Swift platform slug
@@ -101,13 +184,14 @@ swift_platform() {
                 20.04) echo "ubuntu2004" ;;
                 22.04) echo "ubuntu2204" ;;
                 24.04) echo "ubuntu2404" ;;
-                *)     echo "ubuntu2404" ;; # newer versions use latest supported Swift build
+                24.10) echo "ubuntu2410" ;;
+                *)     echo "ubuntu2404" ;;
             esac
             ;;
         debian)
             case "${DISTRO_VERSION}" in
-                12) echo "debian12" ;;
-                *)  die "unsupported Debian version: ${DISTRO_VERSION} (need 12)" ;;
+                12|13) echo "debian12" ;;
+                *)     die "unsupported Debian version: ${DISTRO_VERSION} (need 12+)" ;;
             esac
             ;;
         fedora)
@@ -124,7 +208,7 @@ swift_platform() {
             echo "ubi9"
             ;;
         *)
-            die "unsupported distribution: ${DISTRO_ID}. Supported: ubuntu, debian, fedora, amzn, rhel"
+            die "no Swift platform tarball for ${DISTRO_ID}; install Swift manually and re-run with --skip-swift"
             ;;
     esac
 }
@@ -147,7 +231,13 @@ install_deps() {
                 libstdc++-12-dev libxml2-dev libz3-dev pkg-config tzdata \
                 zip unzip zlib1g-dev curl
             ;;
-        fedora|rhel|centos)
+        fedora)
+            sudo dnf install -y \
+                binutils gcc git libcurl-devel libedit-devel libicu-devel \
+                libuuid-devel libxml2-devel python3-devel sqlite-devel \
+                zip unzip curl
+            ;;
+        rhel|centos)
             sudo dnf install -y \
                 binutils gcc git libcurl-devel libedit-devel libicu-devel \
                 libuuid-devel libxml2-devel python3-devel sqlite-devel \
@@ -159,12 +249,32 @@ install_deps() {
                 libuuid-devel libxml2-devel python3-devel sqlite-devel \
                 tar gzip curl
             ;;
+        opensuse)
+            sudo zypper install -y \
+                binutils gcc git curl libcurl-devel libedit-devel libicu-devel \
+                libuuid-devel libxml2-devel python3-devel sqlite3-devel \
+                timezone zip unzip
+            ;;
+        arch)
+            sudo pacman -Sy --needed --noconfirm \
+                base-devel git curl icu libxml2 ncurses sqlite zlib libedit \
+                python zip unzip
+            ;;
     esac
     ok "system dependencies installed"
 }
 
 # Download and install Swift
 install_swift() {
+    # Distros without official Swift tarballs
+    if [ "${DISTRO_ID}" = "arch" ] || [ "${DISTRO_ID}" = "opensuse" ]; then
+        if command -v swift &>/dev/null; then
+            ok "Swift already installed: $(swift --version 2>&1 | head -1)"
+            return
+        fi
+        die "no official Swift tarball for ${DISTRO_NAME}\n  Install Swift: https://www.swift.org/install/linux/\n  Then re-run with: $0 --skip-swift"
+    fi
+
     # Check if Swift is already installed at the expected location
     if [ -x "${SWIFT_INSTALL_DIR}/usr/bin/swift" ]; then
         export PATH="${SWIFT_INSTALL_DIR}/usr/bin:${PATH}"
@@ -188,7 +298,7 @@ install_swift() {
         ubuntu)
             # Newer Ubuntu versions use latest supported Swift build
             case "${DISTRO_VERSION}" in
-                20.04|22.04|24.04) ;;
+                20.04|22.04|24.04|24.10) ;;
                 *) swift_distro_version="24.04" ;;
             esac
             ;;
@@ -197,7 +307,7 @@ install_swift() {
     local filename="${SWIFT_TAG}-${DISTRO_ID}${swift_distro_version}"
     case "${DISTRO_ID}" in
         ubuntu) filename="${SWIFT_TAG}-ubuntu${swift_distro_version}" ;;
-        debian) filename="${SWIFT_TAG}-debian${DISTRO_VERSION}" ;;
+        debian) filename="${SWIFT_TAG}-debian12" ;;
         fedora) filename="${SWIFT_TAG}-fedora39" ;;
         amzn)   filename="${SWIFT_TAG}-amazonlinux2" ;;
         rhel|centos) filename="${SWIFT_TAG}-ubi9" ;;
