@@ -1433,7 +1433,9 @@ final class CovenantProcessorTests: XCTestCase {
         let chain = try makeChain()
         let name = "finaddr"
         let nh = nameHash(for: name)
-        let openHeight = 10
+        // Use openHeight=9 so finalizeHeight=50, keeping genesis (height 0)
+        // within the renewal window: age=50, renewalMaturity=10, renewalPeriod=50.
+        let openHeight = 9
         let closedHeight = openHeight + nameParams.openPeriod + nameParams.biddingPeriod + nameParams.revealPeriod
 
         let ownerOp = outpoint(0xA0, 0)
@@ -1457,12 +1459,13 @@ final class CovenantProcessorTests: XCTestCase {
         )
 
         // FINALIZE output uses a DIFFERENT address hash (0xBB*20)
+        // Use the genesis block hash as a valid renewal block reference.
         let mismatchedAddr = Address(unchecked: 0, hash: [UInt8](repeating: 0xBB, count: 20))
         let finalizeCov = CovenantData.makeFinalize(
             nameHash: nh, startHeight: openHeight,
             name: Array(name.utf8), flags: 0,
             claimed: 0, renewals: 0,
-            blockHash: [UInt8](repeating: 0, count: 32)
+            blockHash: chain.tip.hash.bytes
         )
 
         let tx = Transaction(
