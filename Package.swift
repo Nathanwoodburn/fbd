@@ -97,6 +97,10 @@ let package = Package(
                 .define("HAVE_BUILTIN_EXPECT", to: "1"),
                 .define("HAVE_BUILTIN_CTZ", to: "1"),
                 .define("HAVE_ATTRIBUTE_ALWAYS_INLINE", to: "1"),
+                // Disable CPU-specific instructions for portable binaries
+                .define("SNAPPY_HAVE_BMI2", to: "0"),
+                .define("SNAPPY_HAVE_X86_CRC32", to: "0"),
+                .define("SNAPPY_HAVE_SSSE3", to: "0"),
             ]
         ),
 
