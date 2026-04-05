@@ -120,7 +120,6 @@ public final class PeerManager: @unchecked Sendable {
     private var banCleanupTask: Task<Void, Never>?
     private var mempoolExpiryTask: Task<Void, Never>?
     private var addressSaveTask: Task<Void, Never>?
-    private var syncTimeoutTask: Task<Void, Never>?
     private var refillTask: Task<Void, Never>?
 
     /// Create a PeerManager.
@@ -288,16 +287,6 @@ public final class PeerManager: @unchecked Sendable {
             }
         }
 
-        // Sync timeout check every 10 seconds (header/block request timeouts)
-        syncTimeoutTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                self?.chainSync?.checkHeaderTimeout()
-                self?.chainSync?.checkBlockTimeout()
-                self?.chainSync?.checkCompactBlockTimeout()
-            }
-        }
-
         // Ban map cleanup every 10 minutes
         banCleanupTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -345,8 +334,6 @@ public final class PeerManager: @unchecked Sendable {
         mempoolExpiryTask = nil
         addressSaveTask?.cancel()
         addressSaveTask = nil
-        syncTimeoutTask?.cancel()
-        syncTimeoutTask = nil
         refillTask?.cancel()
         refillTask = nil
     }
@@ -399,8 +386,12 @@ public final class PeerManager: @unchecked Sendable {
             }
         }
 
-        // Note: header/block/compact-block timeouts are checked by the
-        // dedicated syncTimeoutTask (every 10s) for faster recovery.
+        // Check for compact block timeouts
+        chainSync?.checkCompactBlockTimeout()
+
+        // Check for header/block request timeouts
+        chainSync?.checkHeaderTimeout()
+        chainSync?.checkBlockTimeout()
 
         // Stale tip detection — request headers once, not every cycle
         if let chain = chain, chainSync?.state == .synced {
@@ -766,7 +757,7 @@ extension PeerManager: PeerMessageDelegate {
             }
         case .getheaders:
             let now = UInt64(Date().timeIntervalSince1970 * 1000)
-            guard now - peerContext.state.lastGetHeadersTime >= 1_000 else {
+            guard now - peerContext.state.lastGetHeadersTime >= 200 else {
                 increasePeerBanScore(peerContext, 5, "getheaders request too frequent")
                 break
             }
@@ -971,8 +962,9 @@ extension PeerManager: PeerMessageDelegate {
                 "from": "\(startHeight)",
                 "to": "\(startHeight + headers.count - 1)",
             ])
-            peer.send(HeadersPacket(items: headers, proofs: proofs))
         }
+        // Always respond — a silent drop leaves the peer waiting forever
+        peer.send(HeadersPacket(items: headers, proofs: proofs))
     }
 
     private func handleGetBlockTxn(_ peer: PeerContext, hash: Hash256, indices: [UInt32]) {

@@ -99,6 +99,10 @@ public final class ChainSync: @unchecked Sendable {
     /// Timestamp when we last sent a getheaders request.
     private var lastHeaderRequest: Double = 0
 
+    /// Scheduled timeout task for header requests. Fires once after 30s
+    /// if no response arrives, switching to a different sync peer.
+    private var headerTimeoutTask: Task<Void, Never>?
+
     /// Timeout for blocktxn response (seconds).
     private static let blockTxnTimeout: TimeInterval = 10
 
@@ -185,6 +189,7 @@ public final class ChainSync: @unchecked Sendable {
         guard state == .syncingHeaders || state == .synced else { return }
 
         // Reset header timeout — we got a response
+        headerTimeoutTask?.cancel()
         lastHeaderRequest = 0
 
         if headers.isEmpty {
@@ -715,6 +720,7 @@ public final class ChainSync: @unchecked Sendable {
 
         let oldPeerId = syncPeerId
         syncPeerId = nil
+        headerTimeoutTask?.cancel()
         lastHeaderRequest = 0
         state = .idle
 
@@ -753,6 +759,18 @@ public final class ChainSync: @unchecked Sendable {
         lastHeaderRequest = Date().timeIntervalSinceReferenceDate
         let locator = chain.getLocator()
         peer.send(GetHeadersPacket(locator: locator))
+        scheduleHeaderTimeout()
+    }
+
+    /// Schedule a one-shot timeout that fires after 30s. If no headers
+    /// arrive in that window, `checkHeaderTimeout()` switches the sync peer.
+    private func scheduleHeaderTimeout() {
+        headerTimeoutTask?.cancel()
+        headerTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.checkHeaderTimeout()
+        }
     }
 
     /// Request headers from all connected peers. Called after transitioning to
