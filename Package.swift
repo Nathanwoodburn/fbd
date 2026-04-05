@@ -405,7 +405,7 @@ let package = Package(
             name: "NetTests",
             dependencies: [
                 "Net", "Base", "ExtCrypto", "Protocol",
-                "Consensus", "Chain",
+                "Consensus", "Chain", "Mining", "Mempool",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Logging", package: "swift-log"),
             ],

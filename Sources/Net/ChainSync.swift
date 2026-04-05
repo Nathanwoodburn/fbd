@@ -174,6 +174,7 @@ public final class ChainSync: @unchecked Sendable {
         }
 
         state = .idle
+        recoverOrphanedHeaders()
     }
 
     /// Called when we receive headers from a peer.
@@ -248,11 +249,13 @@ public final class ChainSync: @unchecked Sendable {
                 pendingBlocks.removeAll()
                 state = .idle
 
-                // Try another peer
+                // Try another peer, or recover orphaned headers
                 if let peers = delegate?.syncGetHandshakedPeers() {
                     let tipHeight = UInt32(chain.tip.height)
                     if let newPeer = peers.first(where: { $0.id != peer.id && $0.state.height > tipHeight }) {
                         startSync(peer: newPeer)
+                    } else {
+                        recoverOrphanedHeaders()
                     }
                 }
                 return
@@ -356,11 +359,13 @@ public final class ChainSync: @unchecked Sendable {
                 blockBuffer.removeAll()
                 state = .idle
 
-                // Try another peer
+                // Try another peer, or recover orphaned headers
                 if let peers = delegate?.syncGetHandshakedPeers() {
                     let tipHeight = UInt32(chain.tip.height)
                     if let newPeer = peers.first(where: { $0.id != peer.id && $0.state.height > tipHeight }) {
                         startSync(peer: newPeer)
+                    } else {
+                        recoverOrphanedHeaders()
                     }
                 }
                 return
@@ -724,11 +729,13 @@ public final class ChainSync: @unchecked Sendable {
         lastHeaderRequest = 0
         state = .idle
 
-        // Try to find a new sync peer
+        // Try to find a new sync peer, or recover orphaned headers
         if let peers = delegate?.syncGetHandshakedPeers() {
             let tipHeight = UInt32(chain.tip.height)
             if let newPeer = peers.first(where: { $0.id != oldPeerId && $0.state.height > tipHeight }) {
                 startSync(peer: newPeer)
+            } else {
+                recoverOrphanedHeaders()
             }
         }
     }
@@ -737,6 +744,31 @@ public final class ChainSync: @unchecked Sendable {
     private func requestFullBlock(peer: PeerContext, hash: Hash256) {
         let item = InvItem(type: .block, hash: hash)
         peer.send(GetDataPacket(items: [item]))
+    }
+
+    /// If the header tip is ahead of stored blocks and the state is idle,
+    /// reset the chain to the stored height so that the next sync cycle
+    /// discovers the correct chain from peers. Without this, the node gets
+    /// permanently stuck: the miner pauses (storedHeight < tip), no timeout
+    /// fires (wrong state), and no peer appears "ahead" of the inflated tip.
+    private func recoverOrphanedHeaders() {
+        guard state == .idle, chain.hasBlockStore, chain.storedHeight < chain.tip.height else { return }
+        logger.warning("Resetting chain to stored height (orphaned entries)", metadata: [
+            "stored": "\(chain.storedHeight)",
+            "tip": "\(chain.tip.height)",
+        ])
+        do {
+            try chain.resetToStoredHeight()
+        } catch {
+            logger.error("Failed to reset chain to stored height: \(error)")
+            return
+        }
+
+        // Re-sync headers from an available peer
+        if let peers = delegate?.syncGetHandshakedPeers(),
+           let peer = peers.first(where: { $0.state.isHandshaked }) {
+            startSync(peer: peer)
+        }
     }
 
     // MARK: - Internal
@@ -835,10 +867,11 @@ public final class ChainSync: @unchecked Sendable {
                     "height": "\(h)",
                     "error": "\(error)",
                 ])
-                state = .idle
                 syncPeerId = nil
                 pendingBlocks.removeAll()
                 blockBuffer.removeAll()
+                state = .idle
+                recoverOrphanedHeaders()
                 return
             }
 
