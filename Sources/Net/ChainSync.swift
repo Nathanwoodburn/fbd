@@ -40,6 +40,12 @@ public final class ChainSync: @unchecked Sendable {
     /// Maximum number of concurrent block requests.
     private static let blockWindowSize = 128
 
+    /// Lock protecting all mutable state. Acquired by every public entry
+    /// point so that concurrent calls from different peer dispatch threads
+    /// are serialized. Lock ordering: ChainSync.lock → Chain.lock (Chain
+    /// never calls back into ChainSync while holding its own lock).
+    private let lock = NSLock()
+
     /// The current state.
     public private(set) var state: State = .idle
 
@@ -127,6 +133,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Called when a peer completes the version/verack handshake.
     public func onPeerHandshake(_ peer: PeerContext) {
+        lock.lock()
+        defer { lock.unlock() }
         guard state == .idle || state == .synced else { return }
 
         if peer.state.height > UInt32(chain.tip.height) {
@@ -159,6 +167,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Called when a peer disconnects.
     public func onPeerDisconnect(_ peer: PeerContext) {
+        lock.lock()
+        defer { lock.unlock() }
         guard peer.id == syncPeerId else { return }
 
         logger.info("Sync peer disconnected", metadata: [
@@ -186,6 +196,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Called when we receive headers from a peer.
     public func onHeaders(_ peer: PeerContext, headers: [BlockHeader], proofs: [BalloonProof]) {
+        lock.lock()
+        defer { lock.unlock() }
         // When synced, accept new block headers from any peer (sendheaders
         // announcements). Adopt this peer as sync peer for block download.
         if state == .synced && !headers.isEmpty {
@@ -227,18 +239,23 @@ public final class ChainSync: @unchecked Sendable {
                 hitOrphan = true
                 // Orphan headers are normal — the peer may be announcing its
                 // tip which we can't connect yet. Just stop processing this
-                // batch. During initial sync we re-request; after sync these
-                // are benign race conditions between peers.
+                // batch and re-request headers using our locator so the peer
+                // can respond with the full fork chain from the common ancestor.
                 if state == .syncingHeaders {
                     logger.info("Orphan header during sync, re-requesting", metadata: [
                         "peer": "\(peer.id)",
                         "added": "\(addedCount)",
                         "tip_height": "\(chain.tip.height)",
                     ])
-                } else {
-                    logger.debug("Ignoring orphan header announcement", metadata: [
+                } else if state == .synced {
+                    // Peer is on a fork we haven't seen — transition to header
+                    // sync to discover it via getheaders locator exchange.
+                    logger.info("Orphan header from peer on unknown fork, syncing", metadata: [
                         "peer": "\(peer.id)",
+                        "tip_height": "\(chain.tip.height)",
                     ])
+                    state = .syncingHeaders
+                    orphanRetries = 0 // Fresh sync cycle
                 }
                 break
             } catch HeaderError.duplicateHeader {
@@ -332,6 +349,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Called when we receive a full block from a peer.
     public func onBlock(_ peer: PeerContext, block: Block) {
+        lock.lock()
+        defer { lock.unlock() }
         guard peer.id == syncPeerId else { return }
         guard state == .syncingBlocks else { return }
 
@@ -489,6 +508,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Called when we receive inventory announcements.
     public func onInv(_ peer: PeerContext, items: [InvItem]) {
+        lock.lock()
+        defer { lock.unlock() }
         let blockItems = items.filter { $0.type == .block }
         guard !blockItems.isEmpty else { return }
 
@@ -511,6 +532,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Called when we receive a compact block from a peer.
     func onCompactBlock(_ peer: PeerContext, data: CompactBlockData) {
+        lock.lock()
+        defer { lock.unlock() }
         // Only process compact blocks when fully synced — during IBD we need
         // sequential blocks from the sync peer, not random tip announcements.
         guard state == .synced else {
@@ -534,6 +557,16 @@ public final class ChainSync: @unchecked Sendable {
                 logger.debug("Duplicate compact block header but entry not found")
                 return
             }
+        } catch HeaderError.orphanHeader {
+            // Peer is on a fork we haven't seen — request headers to
+            // discover the fork via locator exchange.
+            logger.info("Orphan compact block header, syncing fork from peer", metadata: [
+                "peer": "\(peer.id)",
+            ])
+            state = .syncingHeaders
+            syncPeerId = peer.id
+            requestHeaders(peer: peer)
+            return
         } catch {
             logger.debug("Cannot add compact block header", metadata: [
                 "error": "\(error)",
@@ -634,6 +667,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Called when we receive a blocktxn response (missing transactions).
     public func onBlockTxn(_ peer: PeerContext, hash: Hash256, transactions: [Transaction]) {
+        lock.lock()
+        defer { lock.unlock() }
         guard var pending = pendingCompactBlock, pending.blockHash == hash else {
             logger.debug("Received blocktxn for unknown compact block")
             return
@@ -673,6 +708,8 @@ public final class ChainSync: @unchecked Sendable {
 
     /// Check for timed-out compact block requests.
     public func checkCompactBlockTimeout() {
+        lock.lock()
+        defer { lock.unlock() }
         guard let pending = pendingCompactBlock else { return }
         let elapsed = Date().timeIntervalSinceReferenceDate - pending.requestTime
         if elapsed > Self.blockTxnTimeout {
@@ -691,6 +728,8 @@ public final class ChainSync: @unchecked Sendable {
     /// Only triggers when no blocks have been received for 60 seconds,
     /// preventing false timeouts during slow but active block processing.
     public func checkBlockTimeout() {
+        lock.lock()
+        defer { lock.unlock() }
         guard state == .syncingBlocks, !pendingBlocks.isEmpty else { return }
         let now = Date().timeIntervalSinceReferenceDate
         let timeout: Double = 60
@@ -758,6 +797,8 @@ public final class ChainSync: @unchecked Sendable {
     /// another peer. This prevents getting stuck in syncingHeaders when
     /// the sync peer can't serve headers (e.g., block store behind tip).
     public func checkHeaderTimeout() {
+        lock.lock()
+        defer { lock.unlock() }
         guard state == .syncingHeaders, lastHeaderRequest > 0 else { return }
         let now = Date().timeIntervalSinceReferenceDate
         guard now - lastHeaderRequest >= 30 else { return }
@@ -820,6 +861,7 @@ public final class ChainSync: @unchecked Sendable {
         previousState = state
         state = .syncingHeaders
         syncPeerId = peer.id
+        orphanRetries = 0
 
         logger.debug("Starting header sync", metadata: [
             "peer": "\(peer.id)",
@@ -943,15 +985,14 @@ public final class ChainSync: @unchecked Sendable {
 
             initialSyncDone = true
             state = .synced
-            let lastPeerId = syncPeerId
             syncPeerId = nil
             pendingBlocks.removeAll()
             blockBuffer.removeAll()
 
-            // Re-request headers — announcements during syncingBlocks are dropped
-            if let id = lastPeerId, let peer = delegate?.syncGetPeer(id: id) {
-                requestHeaders(peer: peer)
-            }
+            // Re-request headers from all peers — announcements during
+            // syncingBlocks are dropped, so other peers may have forks
+            // we haven't seen yet.
+            requestHeadersFromAllPeers()
         }
     }
 
