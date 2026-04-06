@@ -226,15 +226,20 @@ public final class NameDB {
             let result = try tree.commitDirtyNodes(nextNodeId: nextNodeId, estimatedDirtyCount: pendingCount * 10)
 
             var ops: [(db: UInt8, op: LevelDBStore.BatchOp)] = []
-            ops.reserveCapacity(result.dirtyNodes.count + result.staleNodeIds.count + 3)
+            ops.reserveCapacity(result.dirtyNodes.count + 3)
 
-            // Delete stale nodes (old versions superseded by this commit).
-            // This is critical for controlling tree storage growth — without it,
-            // every modified path from root to leaf leaves behind orphaned data.
-            for staleId in result.staleNodeIds {
-                ops.append((db: nodesDB, op: .delete(key: nodeIdKey(staleId))))
-                nodeCache.removeValue(forKey: staleId)
-            }
+            // IMPORTANT: we do NOT delete "stale" nodes during commit. A
+            // superseded node (old version of an internal node or old root)
+            // may still be referenced by an older snapshot that's retained
+            // for rollback support. Deleting it would corrupt those snapshots
+            // and cause rollbackToHeight to fail with corruptedData — which
+            // is exactly how reorgs across tree-commit boundaries break.
+            //
+            // Trade-off: the nodes database grows unbounded until a future
+            // compaction pass can safely GC nodes not reachable from any
+            // retained snapshot. For a blockchain with infrequent deep reorgs,
+            // this growth is bounded by (blocks_with_covenants * tree_interval).
+            // See the staleNodeIds field in UrkelTree.CommitResult.
 
             // Write dirty nodes and populate application cache.
             // These nodes will be re-read on the next commit (after collapse

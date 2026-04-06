@@ -283,7 +283,7 @@ final class ChainSyncTests: XCTestCase {
         XCTAssertEqual(sync.state, .syncingHeaders)
     }
 
-    func testSyncPeerDisconnectGoesIdleWhenNoPeers() throws {
+    func testSyncPeerDisconnectGoesSyncedWhenNoPeers() throws {
         let chain = try Chain(network: .regtest)
         chain.clockOverride = chain.tip.time
         let delegate = MockChainSyncDelegate()
@@ -299,7 +299,10 @@ final class ChainSyncTests: XCTestCase {
         delegate.peers.removeAll()
         sync.onPeerDisconnect(peer)
 
-        XCTAssertEqual(sync.state, .idle)
+        // Should transition to .synced (NOT .idle). Going to .idle would
+        // silently drop all incoming header broadcasts via the state guard
+        // in onHeaders, permanently stranding the node.
+        XCTAssertEqual(sync.state, .synced)
         XCTAssertNil(sync.syncPeerId)
     }
 

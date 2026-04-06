@@ -10,8 +10,11 @@ import Storage
 
 /// Errors specific to the header chain index.
 public enum HeaderError: Error, Sendable {
-    /// The header's hash already exists in the chain.
-    case duplicateHeader
+    /// The header's hash already exists in the chain. Carries the existing
+    /// entry so callers (compact block handling) can access the correct
+    /// hash without having to look it up via byHeight, which would return
+    /// the wrong entry for forked headers.
+    case duplicateHeader(existing: ChainEntry)
     /// The header's prevBlock is not in the chain (orphan).
     case orphanHeader
     /// The difficulty bits do not match the expected value.
@@ -190,12 +193,15 @@ public final class Chain: @unchecked Sendable {
         guard target >= 0, target < _tip.height else { return }
         guard let entry = byHeight[target] else { return }
 
-        // Remove in-memory entries above the stored height
+        // Remove ALL in-memory entries above the stored height, including
+        // fork entries in byHash. Leaving fork entries behind would orphan
+        // them (their prev is being removed), which later causes findFork()
+        // to return nil and block legitimate reorganizations to chains that
+        // descend from those forks.
         for h in (target + 1)..._tip.height {
-            if let e = byHeight.removeValue(forKey: h) {
-                byHash.removeValue(forKey: e.hash)
-            }
+            byHeight.removeValue(forKey: h)
         }
+        byHash = byHash.filter { $0.value.height <= target }
 
         // Truncate persistent entry store
         try store?.truncateToHeight(target)
@@ -351,13 +357,13 @@ public final class Chain: @unchecked Sendable {
             && existing.nonce == header.nonce
             && existing.time == header.time
             && existing.bits == header.bits {
-            throw HeaderError.duplicateHeader
+            throw HeaderError.duplicateHeader(existing: existing)
         }
 
         // Verify proof samples and derive hash
         let hash = try ProofOfWork.verifyWithProof(header: header, proof: proof, params: params)
-        guard byHash[hash] == nil else {
-            throw HeaderError.duplicateHeader
+        if let existing = byHash[hash] {
+            throw HeaderError.duplicateHeader(existing: existing)
         }
 
         // Check PoW (uses precomputed/verified hash)
@@ -559,12 +565,22 @@ public final class Chain: @unchecked Sendable {
 
     /// Walk back to find an ancestor at a specific height (internal unlocked version).
     func _getAncestor(entry: ChainEntry, height: Int) -> ChainEntry? {
-        // Try the height index first (fast path for best chain)
-        if let indexed = byHeight[height] {
+        guard height >= 0, height <= entry.height else { return nil }
+
+        // Fast path: only valid when `entry` is on the best chain. byHeight
+        // only indexes best-chain entries, so taking this shortcut for a
+        // fork entry would return the wrong ancestor — the best-chain
+        // entry at that height rather than the fork's own ancestor. This
+        // is catastrophic for difficulty retarget validation, which would
+        // then compute expected bits from the wrong window and reject
+        // valid fork headers as badDifficulty.
+        if byHeight[entry.height]?.hash == entry.hash,
+           let indexed = byHeight[height] {
             return indexed
         }
 
-        // Walk back through prevBlock pointers
+        // Slow path: walk back through prevBlock pointers. Required when
+        // validating headers on a fork that isn't currently our best chain.
         var current = entry
         while current.height > height {
             guard let prev = byHash[current.prevBlock] else { return nil }
@@ -600,11 +616,18 @@ public final class Chain: @unchecked Sendable {
             byHeight.removeValue(forKey: h)
         }
 
-        // Add new chain entries to byHeight (walk from newTip back to fork)
+        // Add new chain entries to byHeight (walk from newTip back to fork).
+        // Every entry in byHash should have its parent in byHash (chain.add
+        // enforces this), so the walk should always complete.
         var current = newTip
         while current.height > fork.height {
             byHeight[current.height] = current
-            guard let prev = byHash[current.prevBlock] else { break }
+            guard let prev = byHash[current.prevBlock] else {
+                // Should be unreachable. If it happens, byHeight has gaps
+                // above fork.height — tip is reset to fork below so the
+                // next sync can rebuild the chain cleanly.
+                break
+            }
             current = prev
         }
 

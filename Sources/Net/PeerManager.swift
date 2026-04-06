@@ -756,12 +756,17 @@ extension PeerManager: PeerMessageDelegate {
                 ])
             }
         case .getheaders:
-            let now = UInt64(Date().timeIntervalSince1970 * 1000)
-            guard now - peerContext.state.lastGetHeadersTime >= 200 else {
-                increasePeerBanScore(peerContext, 5, "getheaders request too frequent")
-                break
-            }
-            peerContext.state.lastGetHeadersTime = now
+            // No rate limit on getheaders. Legitimate peers in the middle
+            // of fork-convergence across a large mesh send many getheaders
+            // in a short window (each orphan announcement from any OTHER
+            // peer triggers a getheaders to this one). Both previous
+            // strategies were broken:
+            //   - Ban-on-exceed → banned legitimate peers during reorgs
+            //   - Silent-drop-on-exceed → requester waits forever for a
+            //     response that never comes, deadlocking fork discovery
+            // Handling a getheaders is cheap (single locator lookup +
+            // small response). Just serve every request.
+            peerContext.state.lastGetHeadersTime = UInt64(Date().timeIntervalSince1970 * 1000)
             do {
                 let pkt = try GetHeadersPacket.decode(from: payload)
                 handleGetHeaders(peerContext, locator: pkt.locator, stop: pkt.stop)
@@ -897,6 +902,11 @@ extension PeerManager: PeerMessageDelegate {
                             guard !Task.isCancelled else { break }
                             guard let chain = chain else { break }
                             guard let entry = chain.getEntry(hash: item.hash) else { continue }
+                            // Only serve blocks on the current best chain.
+                            // The block store only holds best-chain blocks, so
+                            // loading by height for a fork entry would return
+                            // the wrong block (different hash).
+                            guard chain.getEntryByHeight(entry.height)?.hash == entry.hash else { continue }
                             guard let block = try? chain.getBlock(height: entry.height) else { continue }
 
                             switch item.type {
@@ -934,9 +944,16 @@ extension PeerManager: PeerMessageDelegate {
     private func handleGetHeaders(_ peer: PeerContext, locator: [Hash256], stop: Hash256) {
         guard let chain = chain else { return }
 
+        // Find the most recent locator entry that is on OUR best chain.
+        // Matching against byHash (any known header, including forks) would
+        // pick a fork entry whose height we have, then serve our best-chain
+        // header at that height + 1, whose prevBlock the requester doesn't
+        // know — producing an orphan loop. Genesis is always on the best
+        // chain, so this is guaranteed to find a match.
         var startHeight = 0
         for hash in locator {
-            if let entry = chain.getEntry(hash: hash) {
+            if let entry = chain.getEntry(hash: hash),
+               chain.getEntryByHeight(entry.height)?.hash == entry.hash {
                 startHeight = entry.height + 1
                 break
             }
@@ -945,8 +962,14 @@ extension PeerManager: PeerMessageDelegate {
         var headers = [BlockHeader]()
         var proofs = [BalloonProof]()
         let maxHeaders = NetConstants.maxHeaders
+        // Cap the loop at stored height. Headers are serviceable only when
+        // we have the full block (for the BalloonProof). During an active
+        // reorg or mid-sync, byHeight may be ahead of storedHeight; serving
+        // headers we can't prove would either produce a partial response or
+        // force the peer to recompute BalloonHash.
+        let maxServableHeight = chain.hasBlockStore ? chain.storedHeight : chain.tip.height
         var h = startHeight
-        while headers.count < maxHeaders {
+        while headers.count < maxHeaders && h <= maxServableHeight {
             guard let entry = chain.getEntryByHeight(h) else { break }
             guard let block = try? chain.getBlock(height: h) else { break }
             headers.append(entry.toHeader())
@@ -975,6 +998,15 @@ extension PeerManager: PeerMessageDelegate {
         guard let chain = chain else { return }
         guard let entry = chain.getEntry(hash: hash) else {
             logger.debug("getblocktxn for unknown block", metadata: [
+                "hash": "\(hash.hex)",
+            ])
+            return
+        }
+        // Only serve blocks on the current best chain. Fork entries share
+        // heights with best-chain entries but have different hashes; loading
+        // by height would return the wrong block.
+        guard chain.getEntryByHeight(entry.height)?.hash == entry.hash else {
+            logger.debug("getblocktxn for fork block (not on best chain)", metadata: [
                 "hash": "\(hash.hex)",
             ])
             return
@@ -1033,6 +1065,7 @@ extension PeerManager: PeerMessageDelegate {
         let hasCompactPeer = targets.contains { $0.state.compactMode == 1 }
         if hasCompactPeer, let chain = chain,
            let entry = chain.getEntry(hash: hash),
+           chain.getEntryByHeight(entry.height)?.hash == entry.hash,
            let block = try? chain.getBlock(height: entry.height) {
             compactData = CompactBlockData.fromBlock(block, headerHash: hash)
         }

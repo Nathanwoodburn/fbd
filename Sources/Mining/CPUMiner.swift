@@ -119,7 +119,9 @@ public final class CPUMiner: Sendable {
                     lastRate = try await self.mineNextBlock(lastRate: lastRate)
                 } catch is CancellationError {
                     break
-                } catch HeaderError.headerMismatch, HeaderError.duplicateHeader {
+                } catch HeaderError.headerMismatch {
+                    self.logger.debug("Stale mined block, retrying", source: "Miner")
+                } catch HeaderError.duplicateHeader {
                     // Stale block — tip changed while we were mining, just retry
                     self.logger.debug("Stale mined block, retrying", source: "Miner")
                 } catch let error as BlockStoreError {

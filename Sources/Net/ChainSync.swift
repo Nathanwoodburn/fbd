@@ -190,14 +190,50 @@ public final class ChainSync: @unchecked Sendable {
             }
         }
 
+        // No peer is ahead — handle any orphaned headers, then transition
+        // to .synced so we keep accepting new block announcements via
+        // sendheaders. Going to .idle would silently drop incoming
+        // headers (the state guard in onHeaders rejects .idle), which
+        // permanently strands the node in multi-miner clusters where
+        // peers' announced height isn't strictly greater than ours.
         state = .idle
         recoverOrphanedHeaders()
+        if state == .idle {
+            state = .synced
+        }
     }
 
     /// Called when we receive headers from a peer.
     public func onHeaders(_ peer: PeerContext, headers: [BlockHeader], proofs: [BalloonProof]) {
         lock.lock()
         defer { lock.unlock() }
+
+        // While downloading blocks, still INDEX incoming header announcements
+        // so we don't miss new tip extensions broadcast by other miners. We
+        // can't change state or syncPeerId here (we'd disrupt the in-progress
+        // block download), but we can add the headers to the chain index.
+        // After the current block download finishes, onBlock's "caught up?"
+        // check will see the higher tip and continue syncing automatically.
+        //
+        // Without this, a node that was passively serving block-getdata
+        // requests would transition to .syncingBlocks the moment it received
+        // its first header broadcast, and from that point on every other
+        // miner's broadcast would be silently dropped — permanently stalling
+        // the node at whichever block it happened to be downloading.
+        if state == .syncingBlocks && !headers.isEmpty {
+            for (idx, header) in headers.enumerated() {
+                guard idx < proofs.count else { return }
+                do {
+                    _ = try chain.add(header: header, proof: proofs[idx])
+                } catch {
+                    // Orphans, duplicates, validation failures — all expected
+                    // here since we may receive headers for any chain. The
+                    // important thing is we tried.
+                }
+            }
+            return
+        }
+
         // When synced, accept new block headers from any peer (sendheaders
         // announcements). Adopt this peer as sync peer for block download.
         if state == .synced && !headers.isEmpty {
@@ -231,6 +267,12 @@ public final class ChainSync: @unchecked Sendable {
             do {
                 let entry = try chain.add(header: header, proof: proofs[idx])
                 addedCount += 1
+                // Track the peer's advertised tip so subsequent "is this
+                // peer ahead of us?" checks (used in peer selection after
+                // disconnect/timeout) reflect their actual chain height.
+                if UInt32(entry.height) > peer.state.height {
+                    peer.state.height = UInt32(entry.height)
+                }
                 logger.debug("Added header \(entry.height)", metadata: [
                     "hash": "\(entry.hash.hex.prefix(16))…",
                     "progress": "\(addedCount)/\(headers.count)",
@@ -547,15 +589,19 @@ public final class ChainSync: @unchecked Sendable {
         do {
             let entry = try chain.add(header: data.header, proof: data.balloonProof)
             blockHash = entry.hash
+            // Track the peer's advertised tip so peer-selection checks work.
+            if UInt32(entry.height) > peer.state.height {
+                peer.state.height = UInt32(entry.height)
+            }
             try chain.flush()
-        } catch HeaderError.duplicateHeader {
-            // Already have this header — look up the hash from chain index.
-            if let parent = chain.getEntry(hash: data.header.prevBlock),
-               let entry = chain.getEntryByHeight(parent.height + 1) {
-                blockHash = entry.hash
-            } else {
-                logger.debug("Duplicate compact block header but entry not found")
-                return
+        } catch HeaderError.duplicateHeader(let existing) {
+            // Already have this header — use the existing entry's hash
+            // directly. Looking up via byHeight would return the wrong
+            // entry when the header is for a fork we already know about
+            // but that isn't our current best chain.
+            blockHash = existing.hash
+            if UInt32(existing.height) > peer.state.height {
+                peer.state.height = UInt32(existing.height)
             }
         } catch HeaderError.orphanHeader {
             // Peer is on a fork we haven't seen — request headers to
@@ -574,9 +620,11 @@ public final class ChainSync: @unchecked Sendable {
             return
         }
 
-        // Check if we already have this block connected
-        if chain.storedHeight >= chain.tip.height,
-           let entry = chain.getEntry(hash: blockHash),
+        // Check if we already have this block connected. Only best-chain
+        // blocks are stored, so we must verify the entry is on the best
+        // chain — a fork entry at a "stored" height isn't actually stored.
+        if let entry = chain.getEntry(hash: blockHash),
+           chain.getEntryByHeight(entry.height)?.hash == entry.hash,
            entry.height <= chain.storedHeight {
             logger.debug("Already have compact block \(blockHash.hex)")
             return
@@ -790,6 +838,12 @@ public final class ChainSync: @unchecked Sendable {
                 }
             }
         }
+        // Final fallback: if we ended up still in .idle, transition to
+        // .synced so we keep accepting block announcements via sendheaders.
+        // Otherwise the node permanently drops every header it receives.
+        if state == .idle {
+            state = .synced
+        }
     }
 
     /// Check for timed-out header requests.
@@ -821,6 +875,12 @@ public final class ChainSync: @unchecked Sendable {
             } else {
                 recoverOrphanedHeaders()
             }
+        }
+        // If we couldn't find another sync peer or recover, transition to
+        // .synced (not .idle) so we keep accepting block announcements.
+        // .idle silently drops incoming headers.
+        if state == .idle {
+            state = .synced
         }
     }
 
