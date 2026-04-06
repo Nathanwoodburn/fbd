@@ -600,6 +600,39 @@ public final class FullNode: Sendable {
             }
         }
 
+        // Verify tree root integrity against the next stored block's header.
+        // Detects corruption from older builds that didn't roll back the tree
+        // during resetToStoredHeight(). If the root doesn't match, wipe the
+        // tree and rebuild from stored blocks automatically.
+        if !didReindex {
+            let treeCommitHeight = chain.nameRebuildStartHeight - 1 // committedHeight
+            if treeCommitHeight >= 0,
+               treeCommitHeight % NameParams.params(for: config.network).treeInterval == 0,
+               let nextEntry = chain.getEntryByHeight(treeCommitHeight + 1) {
+                let currentRoot = try chain.getCurrentTreeRoot()
+                if currentRoot.bytes != nextEntry.treeRoot.bytes {
+                    logger.warning("Tree root mismatch detected, rebuilding tree...", metadata: [
+                        "committed_height": "\(treeCommitHeight)",
+                        "expected": "\(nextEntry.treeRoot.hex)",
+                        "computed": "\(currentRoot.hex)",
+                    ], source: "Chain")
+                    let namesPath = treeDir + "/names"
+                    chain.closeNameDB()
+                    try? fm.removeItem(atPath: namesPath)
+                    chain.resetNameDB(try NameDB(path: namesPath))
+                    var lastLog = 0
+                    try chain.rebuildNameState { current, total in
+                        if current - lastLog >= 500 || current == total - 1 {
+                            lastLog = current
+                            let pct = total > 0 ? Double(current + 1) / Double(total) * 100 : 0
+                            self.logger.info("Tree rebuild: block \(current)/\(total) (\(String(format: "%.3f", pct))%)", source: "Chain")
+                        }
+                    }
+                    logger.info("Tree rebuild complete (corruption repaired)", source: "Chain")
+                }
+            }
+        }
+
         // Build auction index (LevelDB-backed with --index-auctions, in-memory otherwise).
         do {
             let auctionStorePath = config.indexAuctions ? (chainDir + "/auctionindex") : nil

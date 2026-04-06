@@ -190,6 +190,9 @@ public final class NameDB {
     /// discarding any changes made since the snapshot was taken.
     public func restorePending(_ snapshot: PendingSnapshot) { pending = snapshot }
 
+    /// Clear the pending map (for testing restart simulation).
+    public func clearPendingForTest() { pending.removeAll() }
+
     /// Flush pending name states into the Urkel tree and persist to LevelDB.
     ///
     /// Called every `treeInterval` blocks. Only dirty tree nodes are written,

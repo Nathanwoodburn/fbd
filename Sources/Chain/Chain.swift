@@ -158,9 +158,14 @@ public final class Chain: @unchecked Sendable {
         }
     }
 
-    /// Replace the name database (used by reindexBlocks to reset stale tree state).
-    func resetNameDB(_ newDB: NameDB) {
+    /// Replace the name database (used by reindexBlocks and tree integrity repair).
+    public func resetNameDB(_ newDB: NameDB) {
         self.nameDB = newDB
+    }
+
+    /// Close the name database (for tree wipe + rebuild).
+    public func closeNameDB() {
+        nameDB?.close()
     }
 
     /// The highest block height stored in the block store (-1 if none).
