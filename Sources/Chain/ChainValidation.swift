@@ -495,6 +495,65 @@ extension Chain {
         try _flush()
     }
 
+    /// Wipe and rebuild the Urkel tree from stored blocks.
+    ///
+    /// Used to auto-repair tree corruption detected during sync (invalidTreeRoot).
+    /// Deletes the tree LevelDB, creates a fresh NameDB, and replays all stored
+    /// blocks through `replayCovenants` (matching the `rebuildNameState` path).
+    public func repairTreeFromStoredBlocks() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let treeDir = treeDir, let blockStore = blockStore else { return }
+
+        // Close and delete the corrupted tree
+        nameDB?.close()
+        let namesPath = treeDir + "/names"
+        try? FileManager.default.removeItem(atPath: namesPath)
+        resetNameDB(try NameDB(path: namesPath))
+
+        guard let nameDB = nameDB else { return }
+        let total = blockStore.storedCount
+        guard total > 0 else { return }
+
+        // Re-register genesis names
+        if let genesisBlock = try blockStore.loadBlock(height: 0) {
+            var genesisNames = ["fistbump"]
+            for char in "abcdefghijklmnopqrstuvwxyz0123456789" { genesisNames.append(String(char)) }
+            var hashToName = [[UInt8]: [UInt8]]()
+            for name in genesisNames { hashToName[NameRules.hashName(name).bytes] = Array(name.utf8) }
+            let cb = genesisBlock.transactions[0]
+            let txH = cb.txHash()
+            for (oi, out) in cb.outputs.enumerated() {
+                if out.covenant.type == .register {
+                    let nhb = out.covenant.items[0]
+                    let nh = NameHash(unchecked: nhb)
+                    let res = out.covenant.items.count > 2 ? out.covenant.items[2] : [UInt8]()
+                    let nb = hashToName[nhb] ?? nhb
+                    var ns = NameState()
+                    ns.name = nb; ns.nameHash = nh; ns.height = 0; ns.renewal = 0
+                    ns.registered = true
+                    ns.owner = NameState.Outpoint(hash: txH.bytes, index: oi)
+                    ns.data = res; ns.value = 0; ns.highest = 0
+                    if let f = CovenantData.registerFlags(from: out.covenant) { ns.flags = f }
+                    nameDB.putNameState(nh, ns)
+                }
+            }
+            try nameDB.commit(height: 0)
+        }
+
+        // Replay all stored blocks through replayCovenants
+        for h in 1..<total {
+            guard let block = try blockStore.loadBlock(height: h) else { continue }
+            try CovenantProcessor.replayCovenants(
+                block: block, nameDB: nameDB,
+                height: h, nameParams: nameParams
+            )
+            if h % nameParams.treeInterval == 0 {
+                try nameDB.commit(height: h)
+            }
+        }
+    }
+
     /// The height from which name state rebuild will start.
     ///
     /// Returns 0 if no persisted tree state, otherwise `committedHeight + 1`.

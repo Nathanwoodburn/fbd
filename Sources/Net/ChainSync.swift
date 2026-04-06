@@ -69,6 +69,10 @@ public final class ChainSync: @unchecked Sendable {
     /// Blocks received out of order, waiting to be connected sequentially.
     private var blockBuffer: [Int: Block] = [:]
 
+    /// Whether we've already attempted a tree repair this session.
+    /// Prevents infinite retry loops if the tree is genuinely wrong.
+    private var didRepairTree = false
+
     /// The next block height to connect (process in order).
     private var nextConnectHeight: Int = 0
 
@@ -348,6 +352,22 @@ public final class ChainSync: @unchecked Sendable {
             do {
                 try chain.connectBlock(nextBlock, height: h)
             } catch {
+                // Tree root mismatch likely means local tree corruption from
+                // older builds that didn't roll back the tree on reset. Rebuild
+                // the tree from stored blocks and retry once.
+                if case ChainError.invalidTreeRoot = error, !didRepairTree {
+                    logger.warning("Tree root mismatch — attempting auto-repair", metadata: [
+                        "height": "\(h)",
+                    ])
+                    if let _ = try? chain.repairTreeFromStoredBlocks() {
+                        didRepairTree = true
+                        logger.info("Tree repair complete, retrying block \(h)")
+                        blockBuffer[h] = nextBlock
+                        continue
+                    } else {
+                        logger.error("Tree repair failed")
+                    }
+                }
                 logger.warning("Invalid block from sync peer", metadata: [
                     "peer": "\(peer.id)",
                     "height": "\(h)",
@@ -863,6 +883,15 @@ public final class ChainSync: @unchecked Sendable {
             do {
                 try chain.connectBlock(nextBlock, height: h)
             } catch {
+                if case ChainError.invalidTreeRoot = error, !didRepairTree {
+                    logger.warning("Tree root mismatch during drain — attempting auto-repair", metadata: ["height": "\(h)"])
+                    if let _ = try? chain.repairTreeFromStoredBlocks() {
+                        didRepairTree = true
+                        logger.info("Tree repair complete, retrying block \(h)")
+                        blockBuffer[h] = nextBlock
+                        continue
+                    }
+                }
                 logger.warning("Invalid block during drain", metadata: [
                     "height": "\(h)",
                     "error": "\(error)",
