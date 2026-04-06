@@ -103,6 +103,9 @@ public final class ChainSync: @unchecked Sendable {
     /// Timestamp when we last sent a getheaders request.
     private var lastHeaderRequest: Double = 0
 
+    /// Consecutive orphan header re-requests without progress.
+    private var orphanRetries: Int = 0
+
     /// Scheduled timeout task for header requests. Fires once after 30s
     /// if no response arrives, switching to a different sync peer.
     private var headerTimeoutTask: Task<Void, Never>?
@@ -271,6 +274,26 @@ public final class ChainSync: @unchecked Sendable {
             if addedCount > 0 {
                 do { try chain.flush() } catch {
                     logger.error("Failed to persist headers", metadata: ["error": "\(error)"])
+                }
+                orphanRetries = 0 // Made progress, reset counter
+            } else {
+                orphanRetries += 1
+                if orphanRetries >= 3 {
+                    // Peer keeps sending unchainable headers — switch peers
+                    logger.warning("Peer stuck sending orphan headers, switching", metadata: [
+                        "peer": "\(peer.id)",
+                        "retries": "\(orphanRetries)",
+                    ])
+                    orphanRetries = 0
+                    syncPeerId = nil
+                    state = .idle
+                    if let peers = delegate?.syncGetHandshakedPeers() {
+                        let tipHeight = UInt32(chain.tip.height)
+                        if let newPeer = peers.first(where: { $0.id != peer.id && $0.state.height > tipHeight }) {
+                            startSync(peer: newPeer)
+                        }
+                    }
+                    return
                 }
             }
             requestHeaders(peer: peer)
