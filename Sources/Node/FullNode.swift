@@ -572,31 +572,38 @@ public final class FullNode: Sendable {
             let fromHeight = chain.nameRebuildStartHeight
             let toHeight = chain.storedHeight
             let replayCount = toHeight - fromHeight + 1
-            if fromHeight <= toHeight {
-                if replayCount <= 36 {
-                    // Normal restart: replay uncommitted blocks since last treeInterval commit
-                    logger.debug("Replaying \(replayCount) blocks for name state", metadata: [
-                        "from": "\(fromHeight)",
-                        "to": "\(toHeight)",
-                    ], source: "Chain")
-                    try chain.rebuildNameState(progress: nil)
-                } else {
-                    logger.info("Rebuilding name state...", metadata: [
-                        "from": "\(fromHeight)",
-                        "to": "\(toHeight)",
-                    ], source: "Chain")
-                    var lastLog = fromHeight
-                    try chain.rebuildNameState { current, total in
-                        if current - lastLog >= 100 || current == total - 1 {
-                            lastLog = current
-                            let pct = total > 0 ? Double(current + 1) / Double(total) * 100 : 0
-                            self.logger.info("Name state rebuild: block \(current)/\(total) (\(String(format: "%.3f", pct))%)", source: "Chain")
+            do {
+                if fromHeight <= toHeight {
+                    if replayCount <= 36 {
+                        logger.debug("Replaying \(replayCount) blocks for name state", metadata: [
+                            "from": "\(fromHeight)",
+                            "to": "\(toHeight)",
+                        ], source: "Chain")
+                        try chain.rebuildNameState(progress: nil)
+                    } else {
+                        logger.info("Rebuilding name state...", metadata: [
+                            "from": "\(fromHeight)",
+                            "to": "\(toHeight)",
+                        ], source: "Chain")
+                        var lastLog = fromHeight
+                        try chain.rebuildNameState { current, total in
+                            if current - lastLog >= 100 || current == total - 1 {
+                                lastLog = current
+                                let pct = total > 0 ? Double(current + 1) / Double(total) * 100 : 0
+                                self.logger.info("Name state rebuild: block \(current)/\(total) (\(String(format: "%.3f", pct))%)", source: "Chain")
+                            }
                         }
+                        logger.info("Name state rebuild complete", source: "Chain")
                     }
-                    logger.info("Name state rebuild complete", source: "Chain")
+                } else {
+                    logger.debug("Name state loaded from disk, no replay needed", source: "Chain")
                 }
-            } else {
-                logger.debug("Name state loaded from disk, no replay needed", source: "Chain")
+            } catch {
+                // Tree root mismatch during replay means the persisted tree is
+                // corrupted (from older builds). Wipe and rebuild from genesis.
+                logger.warning("Tree corruption detected during replay (\(error)), rebuilding from scratch...", source: "Chain")
+                try chain.repairTreeFromStoredBlocks()
+                logger.info("Tree rebuild from scratch complete", source: "Chain")
             }
         }
 
