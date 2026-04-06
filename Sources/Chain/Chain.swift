@@ -196,6 +196,12 @@ public final class Chain: @unchecked Sendable {
         try store?.truncateToHeight(target)
         persistedHeight = target
 
+        // Roll back name tree to match the new tip, otherwise stale
+        // pending state causes tree root mismatches on re-sync.
+        if let nameDB = nameDB {
+            try nameDB.rollbackToHeight(target, treeInterval: nameParams.treeInterval)
+        }
+
         stateCache.removeAll()
         _tip = entry
     }
