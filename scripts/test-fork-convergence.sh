@@ -971,6 +971,32 @@ for i in "${!NODE_NAMES[@]}"; do
 done
 ok "Post-reorg covenant propagated correctly"
 
+# ----- phase 9: silent-failure check ---------------------------------------
+#
+# The auto-repair path (`Tree root mismatch — attempting auto-repair`) is a
+# safety net that wipes and rebuilds the entire urkel tree from the
+# blockstore. It self-heals, so observable state is fine — but it indicates
+# the rollback path left the tree in an inconsistent state. On a real node
+# with many names this is an expensive recovery, and earlier versions of the
+# script silently passed even when the bug was firing every reorg. Fail loud
+# instead.
+info "=== Phase 9: scan node logs for silent tree-repair fallbacks ==="
+repair_hits=0
+for i in "${!NODE_NAMES[@]}"; do
+    name="${NODE_NAMES[$i]}"
+    log="$TEST_DIR/node$name.log"
+    if [ -f "$log" ] && grep -qE "Tree root mismatch|Tree repair complete" "$log"; then
+        fail "Node $name fell back to tree auto-repair (rollback path is buggy):"
+        grep -nE "Tree root mismatch|Tree repair complete" "$log" | sed 's/^/    /'
+        repair_hits=$((repair_hits + 1))
+    fi
+done
+if [ "$repair_hits" -gt 0 ]; then
+    fail "$repair_hits node(s) needed tree auto-repair — reorg path is masking a bug"
+    exit 1
+fi
+ok "No tree auto-repair fallbacks — reorg rollback is clean"
+
 # ----- success -------------------------------------------------------------
 
 echo

@@ -209,8 +209,24 @@ public final class Chain: @unchecked Sendable {
 
         // Roll back name tree to match the new tip, otherwise stale
         // pending state causes tree root mismatches on re-sync.
+        //
+        // rollbackToHeight only restores the snapshot at the previous tree
+        // commit boundary; replay covenants from (committedHeight + 1)...target
+        // so pending matches the new tip. See _disconnectTo for the long form.
         if let nameDB = nameDB {
             try nameDB.rollbackToHeight(target, treeInterval: nameParams.treeInterval)
+            let replayStart = nameDB.committedHeight + 1
+            if replayStart <= target {
+                for h in replayStart...target {
+                    guard let block = try blockStore.loadBlock(height: h) else {
+                        throw ChainError.validationFailed("missing block at height \(h) for tree replay")
+                    }
+                    try CovenantProcessor.replayCovenants(
+                        block: block, nameDB: nameDB,
+                        height: h, nameParams: nameParams
+                    )
+                }
+            }
         }
 
         stateCache.removeAll()
@@ -658,8 +674,28 @@ public final class Chain: @unchecked Sendable {
 
         // Roll back name tree first — it must happen before UTXO disconnects
         // so that covenant processing during reconnection sees correct state.
+        //
+        // rollbackToHeight only restores the snapshot at the previous tree
+        // commit boundary (multiples of treeInterval) and clears pending. If
+        // `height` is not itself a commit boundary, the pending state for
+        // blocks (committedHeight + 1)...height is lost. Replay those shared
+        // blocks from the blockstore so pending matches the new tip — without
+        // this, the next commit produces a tree root that diverges from the
+        // chain headers and fires "Tree root mismatch" auto-repair.
         if let nameDB = nameDB {
             try nameDB.rollbackToHeight(height, treeInterval: nameParams.treeInterval)
+            let replayStart = nameDB.committedHeight + 1
+            if replayStart <= height {
+                for h in replayStart...height {
+                    guard let block = try blockStore.loadBlock(height: h) else {
+                        throw ChainError.validationFailed("missing block at height \(h) for tree replay")
+                    }
+                    try CovenantProcessor.replayCovenants(
+                        block: block, nameDB: nameDB,
+                        height: h, nameParams: nameParams
+                    )
+                }
+            }
         }
 
         // Start from the highest stored block, not the header tip. The header
