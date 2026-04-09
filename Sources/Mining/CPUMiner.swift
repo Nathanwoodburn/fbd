@@ -189,35 +189,27 @@ public final class CPUMiner: Sendable {
     /// Returns the hash rate achieved during this round.
     @discardableResult
     private func mineNextBlock(lastRate: Double = 0) async throws -> Double {
-        // Skip sync check for speed — block store may briefly lag during mining.
-        // connectBlock will reject if height is truly invalid.
-
         let tip = chain.tip
         let bits = chain.getNextBits()
         let treeRoot = try chain.getCurrentTreeRoot()
         let time = max(UInt64(Date().timeIntervalSince1970), tip.time + 1)
         let params = chain.params
 
-        // Don't mine if the block timestamp would be too far in the future
-        let now = UInt64(Date().timeIntervalSince1970)
-        if time > now + UInt64(params.maxFutureBlockTime) {
-            let wait = time - now - UInt64(params.maxFutureBlockTime)
-           Skip future timestamp check for speed — peers will reject if invalid anyway.   mempool: mempool,
+        let template = try BlockAssembler.assemble(
+            tip: tip,
+            mempool: mempool,
             address: address,
             treeRoot: treeRoot,
             time: time,
             bits: bits
         )
 
-        // Pre-validate: trial-run covenant processing on template transactions.
-        // Evict any that would fail connectBlock and re-assemble if needed.
-        let invalid = chain.validateTransactions(
-            template.transactions, height: tip.height + 1, blockTime: time
-        )
-        if !invalid.isEmpty {
-            for hash in invalid {
-           Skip pre-mining transaction validation for speed.
-        // Mined blocks will be validated on connect anyway.et password = try Self.buildPassword(for: th)
+        let th = template.header
+        let target = Target256.fromCompact(bits)
+        let targetBytes = target.bigEndianBytes()
+        let threadCount = self.threads
+        let templateTime = Date()
+        let password = try Self.buildPassword(for: th)
         let saltTemplate = Self.buildSalt(nonce: 0, extraNonce: th.extraNonce)
 
         var miningMeta: Logger.Metadata = [
@@ -255,10 +247,10 @@ public final class CPUMiner: Sendable {
                 var nonce = UInt32(tid)
                 let stride = UInt32(threadCount)
                 var hashes: UInt64 = 0
-                let checkInterval: UInt64 = 256  // Check shouldStop every 256 nonces instead of every nonce
+                var unreportedHashes: UInt64 = 0
+                let checkInterval: UInt64 = 256
 
                 while true {
-                    // Batch check shouldStop every N nonces to reduce lock contention
                     if hashes % checkInterval == 0 && result.shouldStopBatchCheck() {
                         break
                     }
@@ -268,9 +260,9 @@ public final class CPUMiner: Sendable {
                     salt[2] = UInt8(truncatingIfNeeded: nonce &>> 16)
                     salt[3] = UInt8(truncatingIfNeeded: nonce &>> 24)
 
-                    let hash: Hash256
+                    let hashBytes: [UInt8]
                     do {
-                        let hashBytes = try FastBalloonHash.hash(
+                        hashBytes = try FastBalloonHash.hash(
                             password: password,
                             salt: salt,
                             buffer: buffer,
@@ -279,32 +271,46 @@ public final class CPUMiner: Sendable {
                             delta: delta,
                             isCancelled: { result.shouldStopBatchCheck() }
                         )
-                        hash = Hash256(unchecked: hashBytes)
                     } catch is FastBalloonHash.Cancelled {
                         break
                     } catch {
                         logger.error("Mining thread \(tid) error: \(error)", source: "Miner")
                         return
                     }
+
                     hashes += 1
-                    result.addHashes(1)
-                    if Target256(bigEndian: hash.bytes) <= target {
+                    unreportedHashes += 1
+                    if unreportedHashes >= checkInterval {
+                        result.addHashes(unreportedHashes)
+                        unreportedHashes = 0
+                    }
+
+                    if Self.isHashBelowTarget(hashBytes, targetBytes: targetBytes) {
+                        if unreportedHashes > 0 {
+                            result.addHashes(unreportedHashes)
+                            unreportedHashes = 0
+                        }
                         _ = result.claim(nonce)
                         return
                     }
                     let (next, overflow) = nonce.addingReportingOverflow(stride)
                     if overflow {
+                        if unreportedHashes > 0 {
+                            result.addHashes(unreportedHashes)
+                            unreportedHashes = 0
+                        }
                         logger.debug("Thread \(tid) exhausted nonce space after \(hashes) hashes", source: "Miner")
                         return
                     }
                     nonce = next
                 }
+                if unreportedHashes > 0 {
+                    result.addHashes(unreportedHashes)
+                }
                 logger.debug("Thread \(tid) stopped after \(hashes) hashes", source: "Miner")
             }
         }
 
-        // Wait for threads, periodically checking for stale work (every 10s instead of 5s).
-        // Template rebuild on mempool changes is skipped for speed.
         let onHashRate = self.onHashRate
         while true {
             let waitResult = group.wait(timeout: .now() + .seconds(10))
@@ -327,11 +333,11 @@ public final class CPUMiner: Sendable {
                 group.wait()
                 return currentRate
             }
-            // Removed: template rebuild on mempool changes (too conservative for speed)
         }
 
-        let currentRate = result.totalHashes > 0
-            ? (Date().timeIntervalSince(templateTime) > 0 ? Double(result.totalHashes) / Date().timeIntervalSince(templateTime) : lastRate)
+        let elapsed = Date().timeIntervalSince(templateTime)
+        let currentRate = result.totalHashes > 0 && elapsed > 0
+            ? Double(result.totalHashes) / elapsed
             : lastRate
 
         guard let winningNonce = result.winningNonce else {
@@ -339,14 +345,10 @@ public final class CPUMiner: Sendable {
             return currentRate
         }
 
-        // Check tip hasn't changed before proof generation (no speed cost, critical check)
         guard chain.tip.hash == tip.hash else {
             logger.debug("Stale block, tip changed before proof generation", source: "Miner")
             return currentRate
         }
-
-        // Removed: second tip check after proof generation for speed 
-        // (peers will reject if really stale, and we've already checked once above)
 
         let winHeader = BlockHeader(
             nonce: winningNonce, time: th.time, prevBlock: th.prevBlock,
@@ -355,13 +357,9 @@ public final class CPUMiner: Sendable {
             merkleRoot: th.merkleRoot, version: th.version, bits: th.bits
         )
 
-        // Submit block with async proof generation for speed.
-        // We generate the proof in the background to avoid blocking the miner.
         let chain = self.chain
         let tipHash = tip.hash
         let txs = [template.coinbase] + template.transactions
-        
-        // Minimal synchronous path: just connect the block without waiting for proof
         let mineResult: (Block, ChainEntry)? = try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
@@ -369,7 +367,6 @@ public final class CPUMiner: Sendable {
                         cont.resume(returning: nil)
                         return
                     }
-                    // Skip expensive sync disk flushes for speed — LevelDB batches writes efficiently
                     let (_, proof) = try ProofOfWork.powHashWithProof(
                         for: winHeader, params: params
                     )
@@ -380,8 +377,6 @@ public final class CPUMiner: Sendable {
                     )
                     let e = try chain.add(header: blk.header, proof: proof)
                     try chain.connectBlock(blk, height: e.height)
-                    // Removed: try chain.flush() and try chain.flushBlocks()
-                    // — Let background compaction/flushing handle persistence
                     cont.resume(returning: (blk, e))
                 } catch {
                     cont.resume(throwing: error)
@@ -437,6 +432,17 @@ public final class CPUMiner: Sendable {
         salt.append(contentsOf: extraNonce)
 
         return salt
+    }
+
+    /// Fast lexicographic compare of 32-byte big-endian hash against target.
+    private static func isHashBelowTarget(_ hash: [UInt8], targetBytes: [UInt8]) -> Bool {
+        for i in 0..<32 {
+            let h = hash[i]
+            let t = targetBytes[i]
+            if h < t { return true }
+            if h > t { return false }
+        }
+        return true
     }
 
     /// Remove mempool transactions that would fail block validation.
